@@ -135,7 +135,10 @@ vacc_dates <- vacc_dates_ds_new |>
   rowwise() %>%
   mutate(most_recent_event = sfun(c_across(ends_with('c_days'))),
          number_events = sum(c_across(ends_with('c_days')) < 0, na.rm = T)) %>%
-  ungroup () 
+  ungroup() |> 
+  mutate(Donor_ID = case_when(Donor_ID == 'FEO' ~ 'FEMO', 
+                              Donor_ID == 'GAM' ~ 'GAL',
+                              TRUE ~ Donor_ID))
 
 #write_tsv(vacc_dates, 'results/ds_ijc_sarscov2_vacc_timepoints_20240409.tsv')
 
