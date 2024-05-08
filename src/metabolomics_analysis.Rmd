@@ -1,0 +1,826 @@
+---
+title: "Down syndrome IJC - Metabolomics"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Libraries}
+library(tidyverse)
+library(recipes)
+library(ggfortify)
+library(lme4)
+library(limma)
+library(pheatmap)
+library(MultiAssayExperiment)
+library(rstatix)
+```
+
+```{r pvca function}
+#https://github.com/dleelab/pvca
+
+PVCA <- function(counts, meta, threshold, inter){
+
+  counts.center <- t(apply(counts, 1, scale, center=TRUE, scale=FALSE))
+  cor.counts <- cor(counts.center)
+  dim(cor.counts)
+  eigen.counts <- eigen(cor.counts)
+  eigen.mat <- eigen.counts$vectors
+  eigen.val <- eigen.counts$values
+  n.eigen <- length(eigen.val)
+  eigen.val.sum <- sum(eigen.val)
+  percents.pcs <- eigen.val/eigen.val.sum
+  meta <- as.data.frame(meta)
+
+  all <- 0
+  npc.in <- 0
+  for(i in 1:n.eigen){
+    all <- all + percents.pcs[i]
+    npc.in <- npc.in + 1
+    if(all > threshold){break}
+  }
+  if (npc.in < 3) {npc <- 3}
+
+  pred.list <- colnames(meta)
+  meta <- droplevels(meta)
+
+  n.preds <- ncol(meta) + 1
+  if(inter) {n.preds <- n.preds + choose(ncol(meta),2)}
+
+  ran.pred.list <- c()
+  for(i in 1:ncol(meta)){
+    ran.pred.list <- c(ran.pred.list, paste0("(1|", pred.list[i],")"))
+  }
+  ##interactions
+  if(inter){
+    for(i in 1:(ncol(meta)-1)){
+      for(j in (i+1):ncol(meta)){
+        ran.pred.list <- c(ran.pred.list, paste0("(1|", pred.list[i], ":", pred.list[j], ")"))
+        pred.list <- c(pred.list, paste0(pred.list[i], ":", pred.list[j]))
+      }
+    }
+  }
+  formula <- paste(ran.pred.list, collapse = " + ")
+  formula <- paste("pc", formula, sep=" ~ ")
+  ran.var.mat <- NULL
+  for(i in 1:npc.in){
+    dat <- cbind(eigen.mat[,i],meta)
+    colnames(dat) <- c("pc",colnames(meta))
+    Rm1ML <- lme4::lmer(formula, dat, REML = TRUE, verbose = FALSE, na.action = na.omit)
+    var.vec <- unlist(VarCorr(Rm1ML))
+    ran.var.mat <- rbind(ran.var.mat, c(var.vec[pred.list], resid = sigma(Rm1ML)^2))
+  }
+  ran.var.mat.std <- ran.var.mat/rowSums(ran.var.mat)
+  wgt.vec <- eigen.val/eigen.val.sum
+  prop.var <- colSums(ran.var.mat.std*wgt.vec[1:npc.in])
+  std.prop.var <- prop.var/sum(prop.var)
+  std.prop.var
+}
+
+PlotPVCA <- function(pvca.res, title){
+  plot.dat <- data.frame(eff=names(pvca.res), prop=pvca.res)
+  p <- ggplot2::ggplot(plot.dat, aes(x=eff, y=prop))
+  p <- p + ggplot2::ggtitle(title)
+  p <- p + ggplot2::geom_bar(stat="identity", fill="steelblue", colour="steelblue")
+  p <- p + ggplot2::geom_text(aes(label=round(prop,3), y=prop+0.04), size=4)
+  p <- p + ggplot2::scale_x_discrete(limits=names(pvca.res))
+  p <- p + ggplot2::scale_y_continuous(limits = c(0,1))
+  p <- p + ggplot2::labs(x= "Effects", y= "Weighted average proportion variance")
+  p <- p + ggplot2::theme_bw()
+  p <- p + ggplot2::theme(plot.background = element_blank() ,panel.grid.major = element_blank(),
+                 panel.grid.minor = element_blank() ,panel.border = element_blank(), panel.background = element_blank())
+  p <- p + ggplot2::theme(axis.line = element_line(color = 'black'))
+  p <- p + ggplot2::theme(axis.title.x = element_text(size = 15, vjust=-0.5))
+  p <- p + ggplot2::theme(axis.title.y = element_text(size = 15, vjust= 1.0))
+  p <- p + ggplot2::theme(axis.text = element_text(size = 12))
+  p <- p + ggplot2::theme(axis.text.x = element_text(angle = 90, vjust= 0.5, hjust=1))
+  p
+}
+```
+
+```{r Load files}
+#ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+ds.mae <- readRDS('data/processed_multiassay_experiment/old/ds_ijc_multiassay_20230622.rds')
+
+pheno <- as.data.frame(colData(ds.mae))
+
+metab.se <- ds.mae[['Metabolites']] 
+```
+
+```{r EDA}
+# remove rows (metabolites) with more than 50% missing data
+metab.counts <- assay(metab.se)[rowMeans(is.na(assay(metab.se))) < 0.5, ]
+
+metab.counts.ds <- merge(as.data.frame(colData(metab.se)[, 11, drop = F]), 
+                         t(metab.counts), by = 'row.names')
+
+metab.imputed <- 
+  recipe(GROUP_ID ~ ., data = metab.counts.ds) %>%
+  update_role(`Row.names`, new_role = "id variable") %>% 
+  step_impute_knn(all_numeric()) %>% 
+  prep()  %>% 
+  bake(new_dat = metab.counts.ds) %>% 
+  relocate(GROUP_ID)
+
+### PCA ----
+pca.metab <- autoplot(prcomp(log(metab.imputed[,-c(1:2)]), scale. = T), 
+         data = metab.imputed[, 1:2], fill = 'GROUP_ID', size = 3, shape = 21) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  theme_bw()
+
+#ggsave('results/metabolites/figures/PCA_metab_visit2.pdf', pca.metab,
+#       scale = 0.5, device = 'pdf')
+
+### PVCA ----
+metadata <- colData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid') %>% 
+  mutate(patientid = sub('\r\n.*', '', CLIENT_SAMPLE_ID)) %>% 
+  left_join(colData(ds.mae) %>% 
+              as.data.frame() %>% 
+              rownames_to_column('patientid')) %>% 
+  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, sex) %>% 
+  mutate(height_meter = ifelse(height_meter > 100, height_meter/100, height_meter)) %>% 
+  mutate(bmi =  weight_kg/height_meter^2) %>% 
+  mutate(bmi = ifelse(bmi == 0, NA, bmi)) %>% 
+  mutate(bmi = ifelse(bmi == Inf, NA, bmi)) %>% 
+  mutate(bmi_category = case_when(bmi < 18.5 ~ 'underweight',
+                                  bmi >= 18.5 & bmi < 25 ~ 'healthy',
+                                  bmi >= 25 & bmi < 30 ~ 'overweight',
+                                  bmi >= 30 ~ 'obesity',
+                                  TRUE ~ NA_character_)) %>% 
+  mutate(age_category = case_when(age_years < 30 ~ 'under_30',
+                                  TRUE ~ 'over_30')) %>% 
+  column_to_rownames('sampleid') %>% 
+  select(ds, age_category, bmi_category, sex)
+
+metab.imputed.matrix <- metab.imputed[,-1] %>% 
+  column_to_rownames('Row.names') %>% 
+  t() %>% 
+  as.matrix()
+
+pvca <- PVCA(metab.imputed.matrix, meta = metadata, threshold = 0.1, inter = F)
+pvca.plot <- PlotPVCA(pvca, title = 'PVCA - Metabolomics')
+
+eset <- ExpressionSet(assayData = metab.imputed.matrix[,rownames(metadata)], 
+                      phenoData = AnnotatedDataFrame(metadata))
+
+batch.factors <- c('ds', 'age_category', 'bmi_category', 'sex')
+
+pvca <- pvcaBatchAssess(eset, batch.factors = batch.factors, threshold = 0.1,
+                        interaction = F)
+
+df <- data.frame("Prop_var" = pvca$dat[1,], "condition" = pvca$label) %>%
+          arrange(desc(Prop_var))
+
+pvca.metabolites <- ggplot(df, aes(x = reorder(condition,Prop_var), 
+                                   y = Prop_var)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Condition",
+         y = "Proportion of variance explained") +
+    theme_bw() +
+    coord_flip()
+
+#ggsave('results/metabolites/figures/PVCA_metabolites.pdf', pvca.metabolites,
+#       device = 'pdf', scale = 0.4)
+```
+
+```{r Linear Model - limma}
+pheno <- colData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid') %>% 
+  mutate(patientid = sub('\r\n.*', '', CLIENT_SAMPLE_ID)) %>% 
+  left_join(colData(ds.mae) %>% 
+              as.data.frame() %>% 
+              rownames_to_column('patientid')) %>% 
+  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, sex) %>% 
+  mutate(height_meter = ifelse(height_meter > 100, height_meter/100, height_meter)) %>% 
+  mutate(bmi =  weight_kg/height_meter^2) %>% 
+  mutate(bmi = ifelse(bmi == 0, NA, bmi)) %>% 
+  mutate(bmi = ifelse(bmi == Inf, NA, bmi)) %>% 
+  column_to_rownames('sampleid') %>% 
+  mutate(age_scaled = scale(age_years)[,1])
+
+designMat <- model.matrix(~ ds + age_scaled + sex, data = pheno)
+
+fit1 <- lmFit(metab.counts[,rownames(pheno)], design = designMat)
+fit2 <- eBayes(fit1)
+top.ds <- topTable(fit2, coef=2, n = Inf, sort.by="none")
+
+summary(decideTests(fit2))
+
+top.ds.annot <- merge(as.data.frame(rowData(metab.se)), top.ds, by = 'row.names') %>% 
+  column_to_rownames('Row.names') %>% 
+  arrange(P.Value)
+
+signif.metabs <- top.ds.annot %>% 
+  filter(adj.P.Val < 0.05)
+
+#write_tsv(signif.metabs, 'results/metabolites/signif_metabolites.tsv')
+#write_tsv(top.ds.annot, 'results/metabolites/linear_regression_metabolite_DS_vs_HC.tsv')
+
+## Heatmap
+metab.annot <- rowData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('metabid') %>% 
+  select(metabid,CHEMICAL_NAME)
+
+signif.metabs.df <- as.data.frame(assay(metab.se))[rownames(signif.metabs), rownames(pheno)] %>% 
+  rownames_to_column('metabid') %>% 
+  left_join(metab.annot) %>% 
+  mutate(CHEMICAL_NAME = sub('\\*', '', CHEMICAL_NAME)) %>% 
+  column_to_rownames('CHEMICAL_NAME') %>% 
+  select(-metabid) 
+
+ds.col <- c("#0D0887FF", "#F0F921FF")
+names(ds.col) <- c('HC', 'DS')
+
+annot.col <- list(Group = ds.col)
+
+pheno <- pheno %>% arrange(ds) %>% 
+  dplyr::rename(Group = ds, Sex = sex, 'Age (years)' = age_years) %>% 
+  mutate(Group = ifelse(Group == 'no', 'HC', 'DS'))
+
+pheatmap(log2(signif.metabs.df), 
+         scale = 'row', annotation_col = pheno[,c(2), drop = F],
+         show_rownames = F, show_colnames = F, annotation_colors = annot.col,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 
+                                    'red', 'darkred'))(100), 
+         cluster_cols = T, cellwidth = 3, cellheight = 2)
+
+#### Enrichment analysis
+gene_set <- fgsea::gmtPathways("data/metabolomics/smpdb_collection_metabolic_transformed.gmt")
+
+metabolon_gene_set <- gene_set[grepl('METABOLON', names(gene_set))]
+metabolon_gene_set <- gene_set
+
+term2gene <- stack(metabolon_gene_set) %>% 
+  dplyr::rename(term = ind, gene = values) %>% 
+  relocate(term, gene) %>% 
+  mutate(term = sub('METABOLON_', '', term)) |> 
+  mutate(term = sub('SMPDB_', '', term)) |> 
+  mutate(term = gsub('_', ' ', term)) 
+
+##GSEA
+rank.metab <- top.ds.annot |> 
+  rownames_to_column('compound_id') |>  
+  mutate(rank = -log10(P.Value)*sign(logFC)) |> 
+  arrange(desc(rank)) |> 
+  select(compound_id, rank) |> 
+  deframe() 
+  
+gsea.metab <- GSEA(rank.metab, TERM2GENE = term2gene, pvalueCutoff = 0.1)  
+
+## ORA
+up.top.ds <- top.ds.annot %>% filter(adj.P.Val < 0.05, logFC > 0)
+down.top.ds <- top.ds.annot %>% filter(adj.P.Val < 0.05, logFC < 0)
+
+metabolon.ora.metab.pos <- enricher(rownames(up.top.ds),
+                           TERM2GENE = term2gene, minGSSize = 5,
+                           universe = rownames(top.ds.annot))
+
+
+ora.pathways <- bind_rows(list(`Upregulated - DS` = metabolon.ora.metab.pos@result,
+               `Dowregulated - DS` = metabolon.ora.metab.neg@result), .id = 'direction') |> 
+  arrange(pvalue) |> 
+  slice_head( n = 20) %>% 
+  mutate(`-log10(pvalue)` = -log10(pvalue)) %>% 
+  arrange(`-log10(pvalue)`) %>% 
+  mutate(ID = factor(ID, levels = unique(ID))) %>% 
+  ggplot(aes(x = `-log10(pvalue)`, y = ID, fill = `-log10(pvalue)`))+
+  geom_point(aes(size = Count), shape = 21) +
+  geom_vline(xintercept = -log10(0.05), linetype = 2, linewidth = 0.3) +
+  scale_fill_viridis_c(option = 'B')+
+  facet_wrap(~direction, scales = 'free_y')+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 35)) +
+  labs(y = '') +
+  theme_classic()
+
+ggsave('results/metabolites/figures/dotplot_ora_up_down_pathways_ds.pdf', ora.pathways, 
+       device = 'pdf', width = 9.5, height = 4)
+
+
+metabolomic.pos.dotplot <- dotplot(metabolon.ora.metab.pos,
+                                   x = 'p.adjust', decreasing = F) +
+  scale_x_continuous(trans = 'reverse') +
+  geom_vline(xintercept = 0.05, linetype= 2, color = 'red') +
+  labs(x = 'p-value adjusted (BH)',  title = 'DS - Upregulated pathways')
+
+ggsave('results/metabolites/figures/dotplot_upregulated_pathways.pdf', 
+       metabolomic.pos.dotplot, device = 'pdf', scale = 0.55)
+
+#ggsave('results/figures/y23wk06/metabolomics.ora.dotplot.pos.png', 
+#       metabolomic.pos.dotplot , device = 'png', scale = 0.7)
+
+metabolon.ora.metab.neg <- enricher(rownames(down.top.ds),
+                           TERM2GENE = term2gene, minGSSize = 5,
+                           universe = rownames(top.ds.annot))
+
+#write_tsv(metabolon.ora.metab.neg@result, 
+#          'results/metabolites/enrichment_analysis_Downregulated_metbs.tsv')
+
+#write_tsv(metabolon.ora.metab.pos@result, 
+#          'results/metabolites/enrichment_analysis_Upregulated_metbs.tsv')
+
+metabolomic.neg.dotplot <- dotplot(metabolon.ora.metab.neg,
+                                   x = 'p.adjust', decreasing = F) +
+  scale_x_continuous(trans = 'reverse') +
+  geom_vline(xintercept = 0.05, linetype= 2, color = 'red') +
+  labs(x = 'p-value adjusted (BH)', title = 'DS - Downregulated pathways') 
+
+ggsave('results/metabolites/figures/dotplot_downregulated_pathways.pdf', 
+       metabolomic.neg.dotplot, device = 'pdf', scale = 0.55)
+
+
+pheno <- pheno %>% arrange(ds)
+
+pheatmap(log2(as.data.frame(assay(metab.se))[, rownames(pheno)]), 
+         scale = 'row', annotation_col = pheno[,c(2,3,6)],
+         show_rownames = T, show_colnames = F,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 
+                                    'red', 'darkred'))(100),
+         cluster_cols = F,
+         cellwidth = 2, cellheight = 10)
+
+pheatmap(log2(as.data.frame(assay(metab.se))[signif.names$Row.names, rownames(pheno)]), 
+         scale = 'row', annotation_col = pheno[,c(2,3,6)],
+         show_rownames = T, show_colnames = F,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 
+                                    'red', 'darkred'))(100),
+         cluster_cols = F,
+         cellwidth = 2, cellheight = 10)
+
+ridgeplot_metab <- signif.metabs %>% 
+  filter(!(grepl('^X-', CHEMICAL_NAME))) %>% 
+  filter(SUB_PATHWAY != 'Partially Characterized Molecules') %>% 
+  group_by(SUB_PATHWAY) %>% 
+  filter(n() >= 3) %>% 
+  ungroup() %>% 
+  arrange(desc(SUPER_PATHWAY)) %>%
+  mutate(SUB_PATHWAY = factor(SUB_PATHWAY, 
+                              levels = unique(SUB_PATHWAY))) %>% 
+  ggplot(aes(x = sign(logFC), y = SUB_PATHWAY)) +
+  geom_density_ridges(aes(fill = SUPER_PATHWAY)) +
+  scale_fill_manual(values = RColorBrewer::brewer.pal(8, 'Set2')) +
+  theme(panel.background = element_blank()) +
+  labs(y = '')
+
+#ggsave('results/metabolites/figures/ridge_plot_metabolic_Pathways.pdf',
+#       ridgeplot_metab, device = pdf, width = 6.5, height = 6)
+
+# Volcano Plot
+signif.up <- top.ds.annot %>% 
+  filter(adj.P.Val < 0.05, logFC > 0) %>% 
+  rownames_to_column('CHEM_ID') %>% 
+  group_by(SUB_PATHWAY) %>% 
+  arrange(desc(logFC), .by_group = T) %>% 
+  column_to_rownames('CHEM_ID')
+
+signif.down <- top.ds.annot %>% 
+  filter(adj.P.Val < 0.05, logFC < 0) %>% 
+  rownames_to_column('CHEM_ID') %>% 
+  group_by(SUB_PATHWAY) %>% 
+  arrange(desc(logFC), .by_group = T) %>% 
+  column_to_rownames('CHEM_ID')
+
+signif.names <- top.ds.annot %>% 
+  filter(CHEMICAL_NAME %in% c('kynurenine', 'valerate (5:0)', 
+                              'trimethylamine N-oxide', 'tryptophan', 'serotonin',
+                              '7-ketodeoxycholate', '3beta-hydroxy-5-cholenoate'))
+
+volcano.metabs <- top.ds.annot %>% 
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(alpha = 0.5) +
+  geom_point(data = signif.up, color = "red", size = 2) +
+  geom_point(data = signif.down, color = "blue", size = 2) +
+  geom_label_repel(data = signif.names, 
+                   aes(label = PLOT_NAME),  
+                   min.segment.length = 0, size = 3, box.padding = 0.5) + 
+  geom_hline(yintercept = -log10(0.05), linetype = 2) +
+  geom_segment(aes(x = 2, y = 9, xend = 4, yend = 9),
+                  arrow = arrow(length = unit(0.5, "cm"))) +
+  annotate("label", label = "Down Syndrome", 
+           x = 3, y = 10, size = 3, colour = "black") +
+  geom_segment(aes(x = -2, y = 9, xend = -4, yend = 9),
+                  arrow = arrow(length = unit(0.5, "cm"))) +
+  annotate("label", label = "Healthy Control", 
+           x = -3, y = 10, size = 3, colour = "black") +
+  scale_x_continuous(limits = c(-5.2,5.2))+
+  theme_bw() +
+  theme(axis.text = element_text(size = 10), 
+        axis.title = element_text(size = 10))
+
+ggsave('results/metabolites/figures/volcano_plot.pdf', volcano.metabs,
+       device = 'pdf', scale = 0.5)
+```
+
+```{r Compare Belgium metabs}
+covid.metabs <- read_tsv('../covid_single-cell/results/signif_metabolites.tsv')
+
+covid.metabs.id <- covid.metabs[covid.metabs$logFC > 0, 1] %>% deframe()
+
+signif.metabs.overlap.covid <- signif.metabs %>% 
+  filter(logFC >0 , Row.names %in% covid.metabs.id)
+
+write_tsv(signif.metabs.overlap.covid, 
+          'results/up_regulated_metabolites_DS_overlap_SevereCovid.tsv')
+
+### Enrichement analysis
+gene_set <- gmtPathways("../covid_single-cell/data/metabolomics/smpdb_collection_metabolic_transformed.gmt")
+
+metabolon_gene_set <- gene_set[grepl('METABOLON', names(gene_set))]
+
+term2gene <- stack(gene_set) %>% 
+  dplyr::rename(term = ind, gene = values) %>% 
+  relocate(term, gene) %>% 
+  mutate(term = sub('METABOLON_', '', term))
+
+metabolon.ora.metab.pos <- enricher(signif.metabs.overlap.covid$Row.names,
+                           TERM2GENE = term2gene)
+
+write_tsv(metabolon.ora.metab.pos@result, 
+          'results/up_regulated_metabolites_DS_overlap_SevereCovid_enriched_pathways.tsv')
+
+metabolomic.pos.dotplot 
+dotplot(metabolon.ora.metab.pos, 
+                                   decreasing = F, color= 'pvalue')
+  scale_x_continuous(trans = 'reverse') +
+  geom_vline(xintercept = 0.05, linetype= 2, color = 'red') +
+  labs(x = 'p-value adjusted (BH)')
+
+#ggsave('results/figures/y23wk06/metabolomics.ora.dotplot.pos.png', 
+#       metabolomic.pos.dotplot , device = 'png', scale = 0.7)
+
+
+```
+
+```{r Linear Model - limma - selected samples}
+pheno.days <- pheno %>% 
+  mutate(visit_1_days = time_length(interval(visit_1_date, 
+                                             visit_1_date), unit = 'days'), 
+         visit_2_days = time_length(interval(visit_1_date, 
+                                             visit_2_date), unit = 'days'),
+         visit_1_from_boost_days = time_length(interval(visit_1_date,
+                                                      sarscov2_vacc_2nd_dose_date), unit = 'days'),
+         visit_2_from_boost_days = time_length(interval(visit_2_date,
+                                                      sarscov2_vacc_2nd_dose_date), unit = 'days'),
+         infect_first_days = time_length(interval(visit_1_date, 
+                                                  sarscov2_infection_1st_date), unit = 'days'))
+
+selected.samples <- pheno.days %>% 
+  as.data.frame() %>% 
+  rownames_to_column('patientid') %>% 
+  filter(!(patientid %in% c('SMP', 371, 181))) %>% 
+  filter(is.na(infect_first_days)) %>% 
+  filter(visit_1_from_boost_days > -100)
+
+metab.se$sample <- sub('_.*', '', colnames(metab.se)) 
+
+metab.sub.se <- metab.se[, metab.se$sample %in% selected.samples$patientid]
+
+# remove rows (metabolites) with more than 50% missing data
+metab.counts <- assay(metab.sub.se)[rowMeans(is.na(assay(metab.sub.se))) < 0.5, ]
+
+metab.counts.ds <- merge(as.data.frame(colData(metab.sub.se)[, 11, drop = F]), 
+                         t(metab.counts), by = 'row.names')
+
+metab.imputed <- 
+  recipe(GROUP_ID ~ ., data = metab.counts.ds) %>%
+  update_role(`Row.names`, new_role = "id variable") %>% 
+  step_impute_knn(all_numeric()) %>% 
+  prep()  %>% 
+  bake(new_dat = metab.counts.ds) %>% 
+  relocate(GROUP_ID)
+
+pheno <- colData(metab.sub.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid') %>% 
+  mutate(patientid = sub('\r\n.*', '', CLIENT_SAMPLE_ID)) %>% 
+  left_join(colData(ds.mae) %>% 
+              as.data.frame() %>% 
+              rownames_to_column('patientid')) %>% 
+  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, sex) %>% 
+  mutate(height_meter = ifelse(height_meter > 100, height_meter/100, height_meter)) %>% 
+  mutate(bmi =  weight_kg/height_meter^2) %>% 
+  mutate(bmi = ifelse(bmi == 0, NA, bmi)) %>% 
+  mutate(bmi = ifelse(bmi == Inf, NA, bmi)) %>% 
+  column_to_rownames('sampleid') %>% 
+  mutate(age_scaled = scale(age_years)[,1])
+
+designMat <- model.matrix(~ ds, data = pheno)
+
+fit1 <- lmFit(metab.counts[, rownames(pheno)], design = designMat, method = 'robust')
+fit2 <- eBayes(fit1)
+top.ds <- topTable(fit2, coef=2, n = Inf, sort.by="none")
+
+summary(decideTests(fit2))
+
+top.ds.annot <- merge(as.data.frame(rowData(metab.se)), top.ds, by = 'row.names')
+
+#write_tsv(top.ds.annot, 'results/metabolites/DS_vs_HC_selected_samples_limma.tsv')
+
+signif.metabs <- top.ds.annot %>% 
+  filter(adj.P.Val < 0.1)
+
+#write_tsv(signif.metabs, 'results/metabolites/signif_metabolites.tsv')
+
+pheno <- pheno %>% arrange(ds) %>% 
+  dplyr::rename(Group = ds, Sex = sex, 'Age (years)' = age_years) %>% 
+  mutate(Group = ifelse(Group == 'no', 'HC', 'DS'))
+
+metab.annot <- rowData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('metabid') %>% 
+  select(metabid,CHEMICAL_NAME)
+
+signif.metabs.df <- as.data.frame(assay(metab.se))[signif.metabs$Row.names, rownames(pheno)] %>% 
+  rownames_to_column('metabid') %>% 
+  left_join(metab.annot) %>% 
+  mutate(CHEMICAL_NAME = sub('\\*', '', CHEMICAL_NAME)) %>% 
+  column_to_rownames('CHEMICAL_NAME') %>% 
+  select(-metabid) 
+
+ds.col <- c("#0D0887FF", "#F0F921FF")
+names(ds.col) <- c('HC', 'DS')
+
+annot.col <- list(Group = ds.col)
+
+pheatmap(log2(signif.metabs.df), 
+         scale = 'row', annotation_col = pheno[,c(2), drop = F],
+         show_rownames = F, show_colnames = F, annotation_colors = annot.col,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 
+                                    'red', 'darkred'))(100), 
+         cluster_cols = F, cellwidth = 3, cellheight = 2)
+```
+
+```{r Correlation metabs - ABs}
+abs <- ds.mae[['Antibodies']] %>% 
+  as.data.frame() %>% 
+  mutate(across(everything(), ~as.numeric(.))) %>% 
+  rownames_to_column('feature') %>% 
+  filter(feature != 'SARS-Cov-2 N') %>% 
+  column_to_rownames('feature')
+
+metab.counts <- assay(metab.se)[rowMeans(is.na(assay(metab.se))) < 0.5, ]
+
+metab.df <- metab.counts %>% 
+  as.data.frame() %>% 
+  rownames_to_column('metabid') %>% 
+  mutate(metabid = paste0('metab_', metabid)) %>% 
+  column_to_rownames('metabid') %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid')
+
+metab.abs <- metab.df %>% 
+  left_join(abs %>% t() %>% as.data.frame() %>%
+              rownames_to_column('sampleid'))
+
+rbd_vs_spike <- metab.abs %>% 
+  column_to_rownames('sampleid') %>% 
+  cor_test(vars = `SARS-CoV-2 Spike`, vars2 = `SARS-CoV-2 RBD`,
+                    method = 'spearman')
+
+metab.abs.stat <- metab.abs %>% 
+  mutate(sampleid = sub('_V2', '',sampleid)) %>% 
+  filter(sampleid %in% selected.samples$patientid) %>% 
+  column_to_rownames('sampleid') %>% 
+  cor_test(vars = starts_with('metab_'), vars2 = !starts_with('metab_'),
+                    method = 'spearman') %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH')
+
+metab.annot <- rowData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('var1') %>% 
+  select(var1, SUB_PATHWAY, CHEMICAL_NAME)
+
+signif.cor.metabs.abs <- metab.abs.stat %>% 
+  filter(p < 0.05) %>% 
+  mutate(var1 = sub('metab_', '', var1)) %>% 
+  left_join(metab.annot) %>% 
+  relocate(var1, SUB_PATHWAY, CHEMICAL_NAME) %>% 
+  arrange(desc(cor))
+
+#write_tsv(signif.cor.metabs.abs, 
+#          'results/metabolites/spearman_correlation_metabolites_antibodies_42_samples.tsv')
+
+spike.abs.stat <- metab.abs %>% 
+  mutate(sampleid = sub('_V2', '',sampleid)) %>% 
+  filter(sampleid %in% selected.samples$patientid) %>% 
+  column_to_rownames('sampleid') %>% 
+  cor_test(vars = starts_with('metab_'), vars2 = 'SARS-CoV-2 Spike',
+                    method = 'spearman') %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH')
+
+metab.annot <- rowData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('var1') %>% 
+  select(var1, SUB_PATHWAY, CHEMICAL_NAME)
+
+cor.spike.abs <- spike.abs.stat %>% 
+  mutate(var1 = sub('metab_', '', var1)) %>% 
+  left_join(metab.annot) %>% 
+  relocate(var1, SUB_PATHWAY, CHEMICAL_NAME) %>% 
+  arrange(desc(cor))
+
+#write_tsv(cor.spike.abs, 
+#          'results/antibodies/spearman_correlation_SARSCoV2Spike_Antibody_vs_Metabolites_42_samples.tsv')
+
+cor.spike.abs <- read_tsv('results/antibodies/spearman_correlation_SARSCoV2Spike_Antibody_vs_Metabolites_42_samples.tsv')
+
+cor.0to1 <- scales::rescale(p1$cor, to=c(0,1))
+pos.nes.0to1 <- nes.0to1[gsea.alum@compareClusterResult$NES > 0]
+min.pos.nes.0to1 <- min(pos.nes.0to1)
+
+spike.cor.plot <- cor.spike.abs %>% 
+  arrange(desc(cor)) %>% 
+  mutate(CHEMICAL_NAME = factor(CHEMICAL_NAME, levels = CHEMICAL_NAME)) %>% 
+  ggplot(aes(x=CHEMICAL_NAME, y = cor)) +
+  geom_col(aes(color = cor)) +
+  theme(axis.line.y  = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  scale_color_viridis(option = 'H') +
+  coord_flip() +
+  scale_y_continuous(limits = c(-0.55, 0.55))+
+  geom_segment(aes(x = 150, y = 0.47, xend = 10, yend = 0.47),
+                  arrow = arrow(length = unit(0.5, "cm"))) +
+  geom_segment(aes(x = 877, y = -0.53, xend = 1007, yend = -0.53),
+                  arrow = arrow(length = unit(0.5, "cm"))) +
+  annotate("label", label = "3b-hydroxy-5-cholenoate", 
+           x = 190, y = 0.35, size = 2.8, colour = "black") +
+  annotate("label", label = "Trimethylamine N-oxide", 
+           x = 850, y = -0.42, size = 2.8, colour = "black") +
+  ylab('Spearman coefficient - SARS-CoV-2 Spike') 
+  
+#ggsave('results/antibodies/waterfall_spike_metab_correlation.pdf', spike.cor.plot,
+#       scale = 0.6)
+
+signif.up <- signif.cor.metabs.abs %>% 
+  filter(cor > 0)
+
+signif.down <- signif.cor.metabs.abs %>% 
+  filter(cor < 0)
+
+gene_set <- fgsea::gmtPathways("data/metabolomics/smpdb_collection_metabolic_transformed.gmt")
+
+term2gene <- stack(gene_set) %>% 
+  dplyr::rename(term = ind, gene = values) %>% 
+  relocate(term, gene) 
+
+ora.metab.up <- clusterProfiler::enricher(signif.up$var1, TERM2GENE = term2gene)
+ora.metab.down <- clusterProfiler::enricher(signif.down$var1, TERM2GENE = term2gene)
+```
+
+```{r Correlation ABs - cytokines}
+pheno.days <- pheno %>% 
+  mutate(visit_1_days = time_length(interval(visit_1_date, 
+                                             visit_1_date), unit = 'days'), 
+         visit_2_days = time_length(interval(visit_1_date, 
+                                             visit_2_date), unit = 'days'),
+         visit_1_from_boost_days = time_length(interval(visit_1_date,
+                                                      sarscov2_vacc_2nd_dose_date), unit = 'days'),
+         visit_2_from_boost_days = time_length(interval(visit_2_date,
+                                                      sarscov2_vacc_2nd_dose_date), unit = 'days'),
+         infect_first_days = time_length(interval(visit_1_date, 
+                                                  sarscov2_infection_1st_date), unit = 'days'))
+
+selected.samples <- pheno.days %>% 
+  as.data.frame() %>% 
+  rownames_to_column('patientid') %>% 
+  filter(!(patientid %in% c('SMP', 371, 181))) %>% 
+  filter(is.na(infect_first_days)) %>% 
+  filter(visit_1_from_boost_days > -100)
+
+abs <- ds.mae[['Antibodies']] %>% 
+  as.data.frame() %>% 
+  mutate(across(everything(), ~as.numeric(.))) %>% 
+  rownames_to_column('abs') %>% 
+  filter(abs != 'SARS-Cov-2 N') %>% 
+  pivot_longer(-abs) %>% 
+  mutate(abs = paste0('abs_', abs)) %>% 
+  pivot_wider(names_from = 'abs', values_from = 'value') 
+
+cytok <- ds.mae[['MSD.plasma']] %>% 
+  as.data.frame() %>% 
+  rownames_to_column('cytokines') %>% 
+  mutate(cytokines = paste0('cytok_', cytokines)) %>% 
+  pivot_longer(-cytokines) %>% 
+  pivot_wider(names_from = 'cytokines', values_from = 'value') 
+  
+abs.cytok.selected.v2 <- abs %>% 
+  full_join(cytok) %>% 
+  filter(grepl('_V2', name)) %>% 
+  mutate(patientid = sub('_V2', '', name)) %>% 
+  filter(patientid %in% selected.samples$patientid) %>% 
+  select(-patientid) 
+  
+abs.cytok.cor.v2 <- abs.cytok.selected.v2 %>% 
+  cor_test(vars = starts_with('abs_'),
+           vars2 = starts_with('cytok_'), method = 'spearman') %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  arrange(p)
+
+#write_tsv(abs.cytok.cor.v2, 
+#          'results/antibodies/spearman_correlation_ABs_Cytokines_42_selected_samples_V2.tsv')
+
+abs.cytok.selected.v1 <- abs %>% 
+  full_join(cytok) %>% 
+  filter(grepl('_V1', name)) %>% 
+  mutate(patientid = sub('_V1', '', name)) %>% 
+  filter(patientid %in% selected.samples$patientid) %>% 
+  select(-patientid)
+
+abs.cytok.cor.v1 <- abs.cytok.selected.v1 %>% 
+  cor_test(vars = starts_with('abs_'),
+           vars2 = starts_with('cytok_'), method = 'spearman') %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  arrange(p)
+
+#write_tsv(abs.cytok.cor.v1, 
+#          'results/antibodies/spearman_correlation_ABs_Cytokines_42_selected_samples_V1.tsv')
+
+abs_v2.cytok_v1.selected <- abs %>% 
+  filter(grepl('_V2', name)) %>% # select ABs from second visit
+  mutate(name = sub('_V2', '', name)) %>% 
+  full_join(cytok %>% 
+              filter(grepl('_V1', name)) %>% # select Cytokines from first visit
+              mutate(name = sub('_V1', '', name))) %>% 
+  filter(name %in% selected.samples$patientid) 
+
+abs_v2.cytok_v1.cor <- abs_v2.cytok_v1.selected %>% 
+  cor_test(vars = starts_with('abs_'),
+           vars2 = starts_with('cytok_'), method = 'spearman') %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  arrange(p)
+
+#write_tsv(abs_v2.cytok_v1.cor, 
+#'results/antibodies/spearman_correlation_Cytokines_V1_ABs_V2_42_selected_samples.tsv')
+```
+
+```{r metabolite annotation}
+library(clipr)
+
+metab.annot <- as.data.frame(rowData(metab.se)) %>% 
+  separate_longer_delim(HMDB, delim = ',') %>%
+  separate_longer_delim(KEGG, delim = ',') %>% 
+  separate_longer_delim(PUBCHEM, delim = ',') %>% 
+  select(CHEMICAL_NAME, HMDB, KEGG, PUBCHEM) %>% 
+  mutate(CHEMICAL_NAME = gsub('\\*', '', CHEMICAL_NAME))
+
+chemical.name <- read_csv('data/metabolomics/annotation/common_name_annotation.csv') %>% 
+  select(Query, Match)
+
+hmdb.name <- read_csv('data/metabolomics/annotation/hmdb_annotation.csv') %>% 
+  select(Query, Match)
+
+kegg.name <- read_csv('data/metabolomics/annotation/kegg_annotation.csv') %>% 
+  select(Query, Match)
+
+pubchem.name <- read_csv('data/metabolomics/annotation/pubchem_annotation.csv') %>% 
+  select(Query, Match) %>% 
+  mutate(Query = as.character(Query))
+
+metab.annot.levels <- metab.annot %>% 
+  left_join(chemical.name, by = c('CHEMICAL_NAME' = 'Query')) %>% 
+  left_join(hmdb.name, by = c('HMDB' = 'Query')) %>% 
+  left_join(kegg.name, by = c('KEGG' = 'Query')) %>% 
+  left_join(pubchem.name, by = c('PUBCHEM' = 'Query')) %>% 
+  mutate(new.name = Match.x) %>% 
+  mutate(new.name = ifelse(is.na(new.name), Match.y, new.name)) %>% 
+  mutate(new.name = ifelse(is.na(new.name), Match.x.x, new.name)) %>% 
+  mutate(new.name = ifelse(is.na(new.name), Match.y.y, new.name))
+
+metab.new.annot <- metab.annot.levels %>% select(CHEMICAL_NAME, new.name) %>% 
+  unique()
+
+x <- up.top.ds %>% 
+  mutate(CHEMICAL_NAME = gsub('\\*', '', CHEMICAL_NAME, )) %>% 
+  left_join(metab.new.annot) %>% 
+  filter(!is.na(new.name))
+
+z <- down.top.ds %>% 
+  mutate(CHEMICAL_NAME = gsub('\\*', '', CHEMICAL_NAME, )) %>% 
+  left_join(metab.new.annot) %>% 
+  filter(!is.na(new.name))
+
+write_clip(z$new.name)
+
+kegg <- read_csv('data/metabolomics/annotation/common_name_annotation.csv') %>% 
+              select(-ChEBI) %>% 
+  bind_rows(read_csv('data/metabolomics/annotation/hmdb_annotation.csv')%>% 
+              select(-ChEBI)) %>% 
+  bind_rows(read_csv('data/metabolomics/annotation/kegg_annotation.csv') %>% 
+              select(-ChEBI)) %>% 
+  bind_rows(read_csv('data/metabolomics/annotation/pubchem_annotation.csv') %>% 
+              select(-ChEBI) %>% mutate(Query = as.character(Query))) %>% 
+  filter(!is.na(KEGG)) %>% 
+  select(KEGG)  %>% 
+  unique()
+
+
+write_tsv(kegg, 'data/metabolomics/kegg_list.txt')
+```
+
+

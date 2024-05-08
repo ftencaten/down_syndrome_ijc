@@ -1,0 +1,614 @@
+---
+title: "Data cleaning"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Libraries}
+library(tidyverse)
+library(MultiAssayExperiment)
+library(SummarizedExperiment)
+```
+
+```{r Vaccination timepoint}
+sfun <- function(x) { 
+  x <- na.omit(x)
+  if (all(x>=0)) NA else max(x[x<0]) 
+}
+
+### Patients timepoints ----
+# Tables were saved and loaded in csv format to avoid issues with mixed date formats
+clinical.timepoints <- read_csv('data/clinical/20230525_ compiled data_ abs DS+ Covid.csv')
+
+vacc_dates_ds_new <- read_csv('data/clinical/vaccination_update/dados enviados para susan em 06022024_SD.csv') |> 
+  filter(!is.na(`Etiqueta coleta de sangue 1`)) |> 
+  mutate(`Etiqueta coleta de sangue 1`= ifelse(`Etiqueta coleta de sangue 1` == ')', 243, 
+                                               `Etiqueta coleta de sangue 1`)) |> 
+  dplyr::rename('data terceira dose' = `data terceiraa dose`)
+
+vacc_dates_hc_new <- read_csv('data/clinical/vaccination_update/dados enviados para susan em 06022024_CTL.csv')|> 
+  filter(!is.na(`Etiqueta coleta de sangue 1`)) 
+
+clinical.timepoints_femo_gam_294 <- readxl::read_excel('data/clinical/20220821_Red Cap 25 junho _Susan_SPR.xlsx', 
+                                                       skip = 1) |> 
+  filter(grepl('(FEMO|GAM|294)', `Etiqueta coleta de sangue 2...1`))
+
+control.extra <- readxl::read_excel('data/clinical/vaccination_update/Info_controles_FMUSP_16-06-2023.xlsx') |> 
+  filter(!is.na(Date))
+  
+
+# infection information comes from the first shared table
+infection.data.extra <- clinical.timepoints_femo_gam_294 |> 
+  mutate(Donor_ID = sub('.*/', '', `Etiqueta coleta de sangue 1...2`)) |> 
+  mutate(`Visit 1 date` = `Data Coleta`,
+         `Visit 2 date` = sub(' .*', '/22', `Etiqueta coleta de sangue 2...1`)) |> 
+  select(Donor_ID, `Visit 1 date`, `Visit 2 date`) |> 
+  mutate(`Visit 2 date` = parse_date_time(`Visit 2 date`, orders = "d/m/y"))
+  
+infection.data <- clinical.timepoints %>% 
+  mutate(Donor_ID = ID...1) %>% 
+  filter(!is.na(Donor_ID)) |>  
+  dplyr::select(Donor_ID, `Visit 1 date`, `Visit 2 date`, 
+                `Infection (2nd)`, `2nd infection date`) %>% 
+  dplyr::rename(`1st infection date` = `Infection (2nd)`) |> 
+  mutate(`Visit 1 date` = parse_date_time(`Visit 1 date`, orders = c("%d-%b-%y")),
+          `Visit 2 date` = parse_date_time(`Visit 2 date`, orders = c("%d-%b-%y")),
+          `1st infection date` = parse_date_time(`1st infection date`, orders = c("%d-%b-%y")),
+         `2nd infection date` = parse_date_time(`2nd infection date`, orders = c("%d-%b-%y"))) |> 
+  full_join(infection.data.extra) |> 
+  filter(!is.na(`Visit 1 date`))
+
+control.extra.clean <- control.extra |> 
+  mutate(`1st vacc. dose type` = 'Coronavac',
+         `2nd vacc. dose type` = 'Coronavac', 
+         `3rd vacc. dose type` = case_when(grepl('Pfizer', `3rd Dose`) ~ 'Pfizer',
+                                           grepl('AZ', `3rd Dose`) ~ 'Astrazen',
+                                           TRUE ~ NA_character_)) |> 
+  mutate(`3rd Dose` = parse_date_time(sub(' .*', '', `3rd Dose`), orders = "d/m/y")) |> 
+  dplyr::rename(Donor_ID = ID, `1st vacc. dose date` = `1st Dose`, 
+                `2nd vacc. dose date` = `2nd Dose`,
+                `3rd vacc. dose date` = `3rd Dose`) |> 
+  select(Donor_ID, `1st vacc. dose date`, `1st vacc. dose type`,
+         `2nd vacc. dose date`, `2nd vacc. dose type`,
+         `3rd vacc. dose date`, `3rd vacc. dose type`)
+
+vacc_dates <- vacc_dates_ds_new |>  
+  bind_rows(vacc_dates_hc_new) |> 
+  mutate(Donor_ID = sub('.*-', '', sub('.*/', '', `Etiqueta coleta de sangue 1`))) %>% 
+  relocate(Donor_ID) |> 
+  left_join(infection.data) |> 
+  dplyr::select( Donor_ID,  `SD?`, `Data de nascimento`, Sexo,
+                `Qual o seu peso? (Kg)`, `Qual a sua altura? (metros)`, 
+                `Visit 1 date`, `Visit 2 date`, Infecção, `1st infection date`, 
+                `2nd infection date`, `Se sim, qual a data da primeira dose?`, 
+                `qual?...13`, `data segunda dose`, `qual?...15`, `data terceira dose`, 
+                `Qual?`, `data quarta dose`, `qual?...19`, `data quinta dose`, `qual?...21`) |>   
+  mutate(across(12:21, ~ifelse(. %in% c('-', 'Nao tomou', 'não tomou', 'nao tomou', 'perdeu'), NA, .)))  |>  
+  dplyr::rename(downsyndrome = `SD?`, dob = `Data de nascimento`, weight_kg = `Qual o seu peso? (Kg)`,
+                height_m = `Qual a sua altura? (metros)`, sex = Sexo, sarscov2_infecction = Infecção,
+                `1st vacc. dose date` = `Se sim, qual a data da primeira dose?`, 
+                `1st vacc. dose type` = `qual?...13`,
+                `2nd vacc. dose date` = `data segunda dose`, `2nd vacc. dose type` = `qual?...15`,
+                `3rd vacc. dose date` = `data terceira dose`, `3rd vacc. dose type` = `Qual?`,
+                `4th vacc. dose date` = `data quarta dose`, `4th vacc. dose type` = `qual?...19`,
+                `5th vacc. dose date` = `data quinta dose`, `5th vacc. dose type` = `qual?...21`) |> 
+  mutate(downsyndrome = ifelse(downsyndrome == 'sim', 'yes', 'no'),
+         weight_kg = ifelse(weight_kg == 0, NA, weight_kg),
+         height_m = case_when(height_m == 0 ~ NA,
+                              height_m > 100  ~ height_m/100,
+                              TRUE ~ height_m),
+         sarscov2_infecction = ifelse(grepl('sim', sarscov2_infecction, 
+                                            ignore.case = T), 'yes', 'no'),
+         `4th vacc. dose date` = ifelse(`4th vacc. dose date` == '0108/2022', 
+                                        '01/08/2022', `4th vacc. dose date`),
+         `5th vacc. dose date` = case_when(`5th vacc. dose date` == 'Bivalente' ~ '08/31/2023', 
+                                           `5th vacc. dose date` == '10/052023' ~  '10/05/2023',
+                                           TRUE ~ `5th vacc. dose date`),
+         `5th vacc. dose type` = ifelse(`5th vacc. dose type` == '31/082023',
+                                        'Bivalente', `5th vacc. dose type`)) |>    
+  mutate(dob = parse_date_time2(dob, orders = c("m/d/y", "m/d/Y"), cutoff_2000 = 60L),
+         `1st vacc. dose date` = parse_date_time(`1st vacc. dose date`, orders = c("m/d/y", "m/d/Y")),
+         `2nd vacc. dose date` = parse_date_time(`2nd vacc. dose date`, orders = c("m/d/y", "m/d/Y")),
+         `3rd vacc. dose date` = parse_date_time(`3rd vacc. dose date`, orders = c("m/d/y", "m/d/Y")),
+         `4th vacc. dose date` = parse_date_time(`4th vacc. dose date`, orders = c("m/d/y", "m/d/Y")),
+         `5th vacc. dose date` = parse_date_time(`5th vacc. dose date`, orders = c("m/d/y", "m/d/Y"))) |>
+  rows_update(control.extra.clean, by = 'Donor_ID') |> 
+  mutate(age_years_at_visit2 = time_length(interval(dob, `Visit 2 date`), unit = 'years'),
+         bmi = weight_kg/height_m^2,
+         `interval_visit2_visit1_days` = time_length(interval(`Visit 2 date`, 
+                                                    `Visit 1 date`), unit = 'days'),
+         `interval_visit2_visit2_days` = 0,
+         `interval_visit2_1st_infec_days` = time_length(interval(`Visit 2 date`, 
+                                                    `1st infection date`), unit = 'days'),
+         `interval_visit2_2nd_infec_days` = time_length(interval(`Visit 2 date`, 
+                                                    `2nd infection date`), unit = 'days'),
+         `interval_visit2_from_1st_vacc_days` = time_length(interval(`Visit 2 date`, 
+                                                    `1st vacc. dose date`), unit = 'days'),
+         `interval_visit2_from_2nd_vacc_days` = time_length(interval(`Visit 2 date`, 
+                                                    `2nd vacc. dose date`), unit = 'days'),
+         `interval_visit2_from_3rd_vacc_days` = time_length(interval(`Visit 2 date`, 
+                                                    `3rd vacc. dose date`), unit = 'days'),
+         `interval_visit2_from_4th_vacc_days` = time_length(interval(`Visit 2 date`, 
+                                                    `4th vacc. dose date`), unit = 'days'),
+         `interval_visit2_from_5th_vacc_days` = time_length(interval(`Visit 2 date`, 
+                                                    `5th vacc. dose date`), unit = 'days')) |> 
+  rowwise() %>%
+  mutate(most_recent_event = sfun(c_across(ends_with('c_days'))),
+         number_events = sum(c_across(ends_with('c_days')) < 0, na.rm = T)) %>%
+  ungroup () 
+
+#write_tsv(vacc_dates, 'results/ds_ijc_sarscov2_vacc_timepoints_20240409.tsv')
+
+recent.event.plot <- vacc_dates |> 
+  ggplot(aes(x = most_recent_event)) + 
+  geom_density(aes(fill = downsyndrome), alpha = 0.5) + 
+  xlab('Time span between the most recent event\nand sample collection (days)') + 
+  scale_x_continuous(breaks = c(0,-50,-100,-150, -200, -400, -600))
+
+#ggsave('results/patients_timepoints_vaccination_most_recent_event.pdf', 
+#       recent.event.plot, scale = 0.5)
+
+vacc.dates.plot <- vacc_dates %>% 
+  dplyr::select(Donor_ID, downsyndrome, starts_with('interval')) %>% 
+  arrange(downsyndrome, 
+          desc(interval_visit2_1st_infec_days),
+          desc(interval_visit2_from_1st_vacc_days),
+          desc(interval_visit2_from_2nd_vacc_days),
+          desc(interval_visit2_from_3rd_vacc_days)) %>% 
+  mutate(Donor_ID = factor(Donor_ID, levels = unique(Donor_ID))) %>% 
+  pivot_longer(-c(Donor_ID, downsyndrome), names_to = 'event', values_to = 'days', 
+               values_drop_na = T) %>% 
+  mutate(group = case_when(grepl('vacc', event) ~ 'Vaccination',
+                           event == 'interval_visit2_visit1_days' ~ 'Visit 1',
+                           event == 'interval_visit2_visit2_days' ~ 'Visit 2',
+                           grepl('infec', event) ~ 'Infecction')) %>% 
+  mutate(group = factor(group, levels = c('Visit 1', 'Visit 2', 'Vaccination', 
+                                          'Infecction')))  %>% 
+ # mutate(vacc_fill = ifelse(grepl('vacc', event), event, NA)) 
+  ggplot(aes(x = days, y = Donor_ID)) +
+  geom_point(aes(shape = group, fill = event), size = 2) + 
+  scale_shape_manual(values = c(22,23,21, 8), name = 'Event')+
+  facet_wrap(~downsyndrome, scales = 'free_y',
+             labeller = as_labeller(c('no' = 'HC', 'yes' = 'DS'))) +
+  labs(x = 'Days from Visit 2 (Feb/Mar-22)', y = 'Donor') +
+ scale_fill_manual(values = c('interval_visit2_1st_infec_days' = "black", 
+                              'interval_visit2_2nd_infec_days' ="black", 
+                              'interval_visit2_from_1st_vacc_days' = "#30123BFF",
+                              'interval_visit2_from_2nd_vacc_days' = "#28BBECFF",
+                              'interval_visit2_from_3rd_vacc_days' = "#A2FC3CFF",
+                              'interval_visit2_from_4th_vacc_days' = "#FB8022FF",
+                              'interval_visit2_from_5th_vacc_days' = "#7A0403FF",
+                              'interval_visit2_visit1_days' = 'grey75', 
+                              'interval_visit2_visit2_days' = 'grey75'),
+                    name = 'SARS-CoV-2 Vaccination', 
+                   breaks = c('interval_visit2_from_1st_vacc_days',
+                              'interval_visit2_from_2nd_vacc_days',
+                              'interval_visit2_from_3rd_vacc_days',
+                              'interval_visit2_from_4th_vacc_days',
+                              'interval_visit2_from_5th_vacc_days'),
+                   labels = c('1st dose', '2nd dose', '3rd dose', '4th dose', '5th dose')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw() +
+  theme(strip.background = element_blank(), 
+        strip.text.x = element_text(size = 15),
+        panel.grid.minor.x = element_blank(),
+        axis.title = element_text(size = 15),
+        axis.text.x = element_text(size = 13),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 15))
+
+#ggsave('results/patients_timepoints_vaccination_update.pdf', vacc.dates.plot, scale = 0.9)
+```
+
+```{r Clinical data}
+### Clinical information ----
+clinical <- readxl::read_excel('data/clinical/20220821_Red Cap 25 junho _Susan_SPR.xlsx',
+                               skip = 1) %>% 
+  janitor::clean_names()
+
+clinical.df <- clinical %>% 
+  mutate(etiqueta_coleta_de_sangue_1_2 = sub('-', '/', 
+                                             etiqueta_coleta_de_sangue_1_2)) %>% 
+  mutate(patientid = sub('.*/', '', etiqueta_coleta_de_sangue_1_2)) %>% 
+  dplyr::select(patientid, sd, idade, qual_o_seu_peso_kg, qual_a_sua_altura_metros,
+         sexo) %>%
+  mutate(patientid = ifelse(patientid == 'FEO', 'FEMO', patientid)) %>% 
+  mutate(patientid = ifelse(patientid == 'GAM', 'GAL', patientid)) %>% 
+  left_join(vacc_dates %>% 
+              select(Donor_ID, ends_with('date'), ends_with('days'), 
+                     most_recent_event, number_events),
+            by = c('patientid' = 'Donor_ID')) %>%  
+  column_to_rownames('patientid') %>% 
+  dplyr::rename(ds = sd, age_years = idade, weight_kg = qual_o_seu_peso_kg,
+                height_meter = qual_a_sua_altura_metros, sex = sexo) %>% 
+  mutate(ds = ifelse(ds == 'sim', 'yes', 'no'), 
+         sex = ifelse(sex == 'Feminino', 'Female', 'Male'),
+         group = 'experimentalGroup')
+
+## Manually add metadata to pathseq control samples 
+sampleid = c('PlasmaControl_S91', 'PlasmaControl_S72', 'PlasmaControl_S18', 
+             'PlasmaControl_S54', 'PlasmaControl_S36', 'PlasmaControl_S129',
+             'PlasmaControl_S109', 'WaterControl_S73', 'WaterControl_S128')
+
+group = c(rep('PlasmaControl', 7), 'WaterControl', 'WaterControl')
+
+pathseq.control.samples <- data.frame(sampleid = sampleid, group = group) 
+
+clinical.df <- clinical.df |> 
+  rownames_to_column('sampleid') |> 
+  full_join(pathseq.control.samples) |> 
+  column_to_rownames('sampleid')
+
+```
+
+```{r Files - Flow cytometry}
+flow_ds <- read_csv('data/flow_cytometry/20231129_Masterfile IJC_raw.csv', 
+                    na = c('n/a', '#DIV/0!'))
+```
+
+```{r Flow cytometry}
+flow.pheno <- flow_ds %>% 
+  select(prism, DS, Age, BMI, Sex) %>% 
+  unique() %>%
+  arrange(prism) %>%
+  mutate(prism = paste0(prism, '_V2')) %>% 
+  column_to_rownames('prism')
+
+## Unstim  
+unstim <- flow_ds %>% 
+  filter(Treatment == 'Unstimulated') %>% 
+  arrange(prism) %>% 
+  mutate(prism = paste0(prism, '_V2')) %>% 
+  column_to_rownames('prism')
+
+columns_to_remove.unstim <- unstim %>% 
+  select_if(is.character)
+
+# remove id + additional character columns 
+unstim.clean <- unstim %>% 
+  select(-c(ORDER, Age, `Weight (kg)`, `Height (meters)`, BMI), 
+         -contains('Visit'), -contains('Supernatant'),
+         -colnames(columns_to_remove.unstim)) %>% 
+  t()
+
+## TCR  
+tcr <- flow_ds %>% 
+  filter(Treatment == 'TCR') %>% 
+  arrange(prism) %>% 
+  mutate(prism = paste0(prism, '_V2')) %>% 
+  column_to_rownames('prism')
+
+columns_to_remove.tcr <- tcr %>% 
+  select_if(is.character)
+
+# remove id + additional character columns 
+tcr.clean <- tcr %>% 
+  select(-c(ORDER, Age, `Weight (kg)`, `Height (meters)`, BMI), 
+         -contains('Visit'), -contains('Supernatant'),
+         -colnames(columns_to_remove.tcr)) %>% 
+  t()
+
+## LPS  
+lps <- flow_ds %>% 
+  filter(Treatment == 'LPS') %>% 
+  arrange(prism) %>% 
+  mutate(prism = paste0(prism, '_V2')) %>% 
+  column_to_rownames('prism')
+
+columns_to_remove.lps <- lps %>% 
+  select_if(is.character)
+
+# remove id + additional character columns 
+lps.clean <- lps %>% 
+  select(-c(ORDER, Age, `Weight (kg)`, `Height (meters)`, BMI), 
+         -contains('Visit'), -contains('Supernatant'),
+         -colnames(columns_to_remove.lps)) %>% 
+  t()
+
+# SummarizedExperiment object
+se.flow <- SummarizedExperiment(assays = list(Unstimulated = unstim.clean,
+                                              TCR = tcr.clean,
+                                              LPS = lps.clean),
+                                colData = flow.pheno)
+
+flow.map <- flow.pheno %>% 
+  rownames_to_column('sampleid') %>% 
+  dplyr::select(sampleid)  %>% 
+  dplyr::mutate(patientid = sub('_.*', '', sampleid)) %>% 
+  dplyr::rename(primary = patientid, colname = sampleid) %>% 
+  relocate(primary)
+```
+
+```{r Files - Antibodies}
+abs.plasma.df <- readxl::read_excel('data/antibodies_msd/Mesoescale_antibodies_Felipe.xlsx', 
+                                    skip = 1)
+```
+
+```{r Antibodies}
+abs.plasma.df.clean <- abs.plasma.df %>% 
+  mutate(Sample = sub('_[0-9].*', '', Sample)) |> 
+  mutate(Sample = case_when(Sample == 'GAM_V1' ~ 'GAL_V1',
+                            Sample == 'Femo_V1' ~ 'FEMO_V1',
+                            Sample == 'TRF_V1' ~ 'TFR_V1',
+                            TRUE ~ Sample)) |> 
+  column_to_rownames('Sample')
+
+abs.plasma.map <- abs.plasma.df.clean %>% 
+  rownames_to_column('sampleid') %>% 
+  select(sampleid) %>%
+  mutate(primary = sub('_.*', '', sampleid)) %>% 
+  relocate(primary, sampleid) %>% 
+  dplyr::rename(colname = sampleid)
+```
+
+```{r Files - Plasma cytokines}
+msd <- read_tsv('data/cytokines_msd/20220929_MSD_DS_PR_Flat inicial.tsv') %>% 
+  janitor::clean_names()
+```
+
+```{r Plasma cytokines}
+cytok.plasma.df <- msd %>% 
+  mutate(sample = sub('-', '_', sub(' ', '_', sample))) %>% 
+  separate(sample, c('patientid', 'visit'), sep = '_') %>% 
+  mutate(visit = ifelse(visit == '09/02/21', '09/02/22', visit)) %>% 
+  mutate(visit = case_when(grepl('(/21|/22)', visit) ~ visit,
+                            is.na(visit) ~ NA_character_,
+                           TRUE ~ paste0(visit, '/21'))) %>% 
+  dplyr::rename(visit_day = visit) %>% 
+  mutate(patientid = sub('^0', '', sub('/', '', patientid))) %>% 
+  mutate(visit = ifelse(grepl('/22', visit_day), 'V2', 'V1')) %>% 
+  relocate(patientid, visit) %>% 
+  mutate(patientid = ifelse(patientid == 'FEO', 'FEMO', patientid)) %>% 
+  mutate(patientid = ifelse(patientid == 'GAM', 'GAL', patientid)) %>% 
+  unite('sampleid', patientid:visit) %>% 
+  select(-visit_day) %>% 
+  column_to_rownames('sampleid')
+
+cytok.plasma.map <- cytok.plasma.df %>% 
+  rownames_to_column('sampleid') %>% 
+  select(sampleid) %>%
+  mutate(primary = sub('_.*', '', sampleid)) %>% 
+  relocate(primary, sampleid) %>% 
+  dplyr::rename(colname = sampleid)
+```
+
+```{r Files - Stimulus cytokines}
+msd.stim <- readxl::read_excel('data/cytokines_msd/20230505_DS_flat_correct_SPR.xlsx',
+                                      sheet = 'Flat Corrected') %>% 
+  janitor::clean_names()
+
+clinical.stim <- read_csv('data/cytokines_msd/clindata DS.csv')
+```
+
+```{r Stimulus cytokines}
+cytok.stim.df <- msd.stim %>% 
+  left_join(clinical.stim %>% select(Sample, prism_ID_merge),
+            by = c('sample_number_well_stim' = 'Sample')) %>% 
+  mutate(prism_ID_merge = sub('_.*', '', prism_ID_merge)) %>% 
+  dplyr::rename(patientid = prism_ID_merge) %>% 
+  relocate(patientid) %>% 
+  filter(!is.na(patientid)) %>% 
+  select(-c(id:sample_number_well_stim)) %>% 
+  mutate(sampleid = paste(patientid, 'V2', stim, sep = '_')) %>% 
+  select(-c(patientid, stim)) %>%  
+  column_to_rownames('sampleid')
+
+cytok.stim.map <- cytok.stim.df %>% 
+  rownames_to_column('sampleid') %>% 
+  select(sampleid) %>% 
+  mutate(primary = sub('_.*', '', sampleid)) %>% 
+  dplyr::rename(colname = sampleid) %>% 
+  relocate(primary)
+```
+
+```{r Files - Metabolomics}
+chem.annot.df <- readxl::read_xlsx('data/metabolomics/EMOR-02-23MD DATA TABLES.XLSX',
+                                    sheet = 'Chemical Annotation') %>%
+  column_to_rownames('CHEM_ID')
+
+sample.annot.df <- readxl::read_xlsx('data/metabolomics/EMOR-02-23MD DATA TABLES.XLSX',
+                                     sheet = 'Sample Meta Data')
+
+metab.count.df <- readxl::read_xlsx('data/metabolomics/EMOR-02-23MD DATA TABLES.XLSX',
+                                     sheet = 'Batch-normalized Data')
+```
+
+```{r Metabolomics - SummarizedExperiment}
+metab.sample.annot <- sample.annot.df %>% 
+  mutate(sampleid = paste0(sub('\r\n.*', '', CLIENT_SAMPLE_ID), '_V2')) %>% 
+#  mutate(sampleid = ifelse(grepl('/22', CLIENT_SAMPLE_ID), 
+#                           paste0(sub('\r\n.*', '', CLIENT_SAMPLE_ID), '_V2'),
+#                           paste0(sub('\r\n.*', '', CLIENT_SAMPLE_ID), '_V1'))) %>% 
+  column_to_rownames('sampleid')
+
+metab.count <- metab.count.df %>% 
+  left_join(metab.sample.annot %>% 
+              rownames_to_column('sampleid') %>% 
+              select(sampleid, PARENT_SAMPLE_NAME)) %>% 
+  column_to_rownames('sampleid') %>% 
+  select(-PARENT_SAMPLE_NAME) %>% 
+  t()
+
+se.metab <- SummarizedExperiment(assays =  metab.count[rownames(chem.annot.df),],
+                                 colData = metab.sample.annot,
+                                 rowData = chem.annot.df)
+
+metab.map <- metab.sample.annot %>% 
+  rownames_to_column('sampleid') %>% 
+  select(sampleid) %>% 
+  mutate(primary = sub('_.*', '', sampleid)) %>% 
+  dplyr::rename(colname = sampleid) %>% 
+  relocate(primary, colname)
+```
+
+```{r Files - Bulk RNA-seq}
+files <- list.files('data/rna-seq/counts/') %>% 
+  enframe() %>% 
+  filter(value != 'out_file.txt') %>%  
+  mutate(value = sub('_Reads.*', '', value)) %>% 
+  mutate(value = sub('.*-s', 's', value)) %>%
+  mutate(value = sub('-.*', '', value)) %>% 
+  select(-name) %>% 
+  deframe()
+
+count <- read_tsv('data/rna-seq/counts/out_file.txt', col_names = F) %>% 
+  filter(grepl('ENS', X1)) %>% 
+  select(1, seq(2,480,4))
+
+colnames(count) <- c('ensemblid', files)
+
+#write_tsv(count, 'data/rna-seq/raw_gene_counts.tsv')
+
+hgnc.annot <- read_tsv('data/rna-seq/hgnc_annotation_from_biomart.tsv')
+```
+
+```{r Bulk RNA-seq  - SummarizedExperiment}
+raw_count <- read_tsv('data/rna-seq/raw_gene_counts.tsv')
+
+rnaseq.count <- raw_count %>% 
+  column_to_rownames('ensemblid') %>% 
+  as.matrix()
+
+rnaseq.sample.annot <- clinical.df %>% 
+  rownames_to_column('patient') %>% 
+  right_join(colnames(rnaseq.count) %>% 
+              enframe(value = 'sampleid') %>% 
+              mutate(patient = sub('.*_', '', sampleid)) %>% 
+              dplyr::select(-name)) %>% 
+  arrange(sampleid) %>% 
+  column_to_rownames('sampleid')
+
+gene_annot <- raw_count %>% 
+  dplyr::select('ensemblid') %>% 
+  left_join(hgnc.annot, by = c('ensemblid' = 'ensembl_gene_id')) %>% 
+  distinct(ensemblid, .keep_all = T) %>% 
+  mutate(hgnc_symbol = ifelse(is.na(hgnc_symbol), ensemblid, hgnc_symbol)) %>% 
+  column_to_rownames('ensemblid') 
+
+se.rnaseq <- SummarizedExperiment(assays = list(counts = rnaseq.count),
+                                  colData = rnaseq.sample.annot,
+                                  rowData = gene_annot)
+
+rnaseq.map <- rnaseq.sample.annot %>% 
+  rownames_to_column('sampleid') %>% 
+  dplyr::select(sampleid, patient) %>% 
+  dplyr::rename(primary = patient, colname = sampleid) %>% 
+  relocate(primary)
+```
+
+```{r Pathseq - Files}
+rna.species <- read_csv('data/pathseq/RNA_Ribeiro_DownSyndrome_Counts/RNA_species_pseudocounts.csv') %>%
+  mutate(across(everything(), ~str_remove_all(., "[-():/']"))) %>% 
+  mutate(across(everything(), ~str_replace_all(., "=", '.')))
+
+dna.species <- read_csv('data/pathseq/DNA_Riebiro_DownSyndrome_counts_Updated/DNA_species_pseudocounts.csv') %>%
+  mutate(across(everything(), ~str_remove_all(., "[-():/']"))) %>% 
+  mutate(across(everything(), ~str_replace_all(., "=", '.')))
+```
+
+```{r Pathseq - phyloseq}
+library(yatah)
+options(yatah_sep = ";")
+
+# RNA ----
+table.rna <- taxtable(rna.species$species)
+
+rownames(table.rna) <- paste0('sp', rownames(table.rna))
+
+# OTU abundance
+otumat.rna = rna.species %>% 
+  dplyr::select(starts_with('RNA')) %>% 
+  mutate(across(everything(), ~as.double(.))) 
+
+rownames(otumat.rna) <- paste0('sp', rownames(otumat.rna))
+
+## Sample table
+sampledf.rna <- data.frame(sampleid = colnames(rna.species[-1])) %>% 
+  mutate(patientid = sub('_.*', '', sub('RNA_', '', sampleid))) %>% 
+  mutate(patientid = ifelse(grepl('Control', sampleid), 
+                            paste(patientid, sub('.*_', '', sampleid), sep = '_'),
+                            patientid)) %>% 
+  left_join(clinical.df %>% rownames_to_column('patientid')) %>% 
+  column_to_rownames('sampleid')
+
+
+se.pathseq.species.rna <- SummarizedExperiment(assays = list(counts = otumat.rna),
+                                                   rowData = table.rna,
+                                                   colData = sampledf.rna)
+
+pathseq.rna.map <- sampledf.rna %>% 
+  rownames_to_column('sampleid') %>% 
+  dplyr::select(sampleid, patientid) %>% 
+  dplyr::rename(primary = patientid, colname = sampleid) %>% 
+  relocate(primary)
+
+# DNA ----
+table.dna <- taxtable(dna.species$species)
+
+rownames(table.dna) <- paste0('sp', rownames(table.dna))
+
+# OTU abundance
+otumat.dna = dna.species %>% 
+  dplyr::select(starts_with('Sample')) %>% 
+  mutate(across(everything(), ~as.double(.))) 
+
+rownames(otumat.dna) <- paste0('sp', rownames(otumat.dna))
+
+## Sample table
+sampledf.dna <- data.frame(sampleid = colnames(dna.species[-1])) %>% 
+  mutate(patientid = sub('_.*', '', sub('Sample_DNA_', '', sampleid))) %>% 
+  mutate(patientid = ifelse(grepl('Control', sampleid), 
+                            paste0(patientid, sub('_L.*', '', 
+                                                  sub('.*_S', '_S', sampleid))),
+                            patientid)) %>% 
+  left_join(clinical.df %>% rownames_to_column('patientid')) %>% 
+  column_to_rownames('sampleid')
+
+
+se.pathseq.species.dna <- SummarizedExperiment(assays = list(counts = otumat.dna),
+                                                   rowData = table.dna,
+                                                   colData = sampledf.dna)
+
+pathseq.dna.map <- sampledf.dna %>% 
+  rownames_to_column('sampleid') %>% 
+  dplyr::select(sampleid, patientid) %>% 
+  dplyr::rename(primary = patientid, colname = sampleid) %>% 
+  relocate(primary)
+```
+
+```{r Build multiassay object}
+listmap <- list(cytok.plasma.map, cytok.stim.map, flow.map, abs.plasma.map, 
+                metab.map, rnaseq.map, pathseq.rna.map, pathseq.dna.map)
+
+names(listmap) <- c("MSD.plasma", "MSD.stim", "Flow.cytometry", "Antibodies", 
+                    "Metabolites", "Bulk.RNAseq", 'Pathseq.RNA', 'Pathseq.DNA')
+
+dfmap <- listToMap(listmap)
+
+objlist <- list("MSD.plasma" = t(cytok.plasma.df), "MSD.stim" = t(cytok.stim.df), 
+                "Flow.cytometry" = se.flow, "Antibodies" = t(abs.plasma.df.clean),
+                "Metabolites" = se.metab, "Bulk.RNAseq" = se.rnaseq,
+                'Pathseq.RNA' = se.pathseq.species.rna,
+                'Pathseq.DNA' = se.pathseq.species.dna)
+
+ds.ma <- MultiAssayExperiment(objlist, clinical.df, dfmap)
+
+
+
+#saveRDS(ds.ma, 'data/processed_multiassay_experiment/ds_ijc_multiassay_20240507.rds')
+```
+
+```{r Build multiassay object - Metabolomics}
+#listmap <- list(metab.map)
+#
+#names(listmap) <- c("Metabolites")
+#
+#dfmap <- listToMap(listmap)
+#
+#objlist <- list("Metabolites" = se.metab)
+#
+#ds.ma <- MultiAssayExperiment(objlist, clinical.df, dfmap)
+
+#saveRDS(ds.ma, 'data/processed_multiassay_experiment/ds_ijc_multiassay_metabolomics.rds')
+```
+

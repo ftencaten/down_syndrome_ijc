@@ -1,0 +1,197 @@
+---
+title: "Down syndrome IJC - Flow cytometry analysis"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load libraries}
+library(MultiAssayExperiment)
+library(tidyverse)
+library(ggfortify)
+library(pvca)
+```
+
+```{r Load files}
+ds.ma <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+```
+
+```{r pvca function}
+#https://github.com/dleelab/pvca
+
+PVCA <- function(counts, meta, threshold, inter){
+
+  counts.center <- t(apply(counts, 1, scale, center=TRUE, scale=FALSE))
+  cor.counts <- cor(counts.center)
+  dim(cor.counts)
+  eigen.counts <- eigen(cor.counts)
+  eigen.mat <- eigen.counts$vectors
+  eigen.val <- eigen.counts$values
+  n.eigen <- length(eigen.val)
+  eigen.val.sum <- sum(eigen.val)
+  percents.pcs <- eigen.val/eigen.val.sum
+  meta <- as.data.frame(meta)
+
+  all <- 0
+  npc.in <- 0
+  for(i in 1:n.eigen){
+    all <- all + percents.pcs[i]
+    npc.in <- npc.in + 1
+    if(all > threshold){break}
+  }
+  if (npc.in < 3) {npc <- 3}
+
+  pred.list <- colnames(meta)
+  meta <- droplevels(meta)
+
+  n.preds <- ncol(meta) + 1
+  if(inter) {n.preds <- n.preds + choose(ncol(meta),2)}
+
+  ran.pred.list <- c()
+  for(i in 1:ncol(meta)){
+    ran.pred.list <- c(ran.pred.list, paste0("(1|", pred.list[i],")"))
+  }
+  ##interactions
+  if(inter){
+    for(i in 1:(ncol(meta)-1)){
+      for(j in (i+1):ncol(meta)){
+        ran.pred.list <- c(ran.pred.list, paste0("(1|", pred.list[i], ":", pred.list[j], ")"))
+        pred.list <- c(pred.list, paste0(pred.list[i], ":", pred.list[j]))
+      }
+    }
+  }
+  formula <- paste(ran.pred.list, collapse = " + ")
+  formula <- paste("pc", formula, sep=" ~ ")
+  ran.var.mat <- NULL
+  for(i in 1:npc.in){
+    dat <- cbind(eigen.mat[,i],meta)
+    colnames(dat) <- c("pc",colnames(meta))
+    Rm1ML <- lme4::lmer(formula, dat, REML = TRUE, verbose = FALSE, na.action = na.omit)
+    var.vec <- unlist(VarCorr(Rm1ML))
+    ran.var.mat <- rbind(ran.var.mat, c(var.vec[pred.list], resid = sigma(Rm1ML)^2))
+  }
+  ran.var.mat.std <- ran.var.mat/rowSums(ran.var.mat)
+  wgt.vec <- eigen.val/eigen.val.sum
+  prop.var <- colSums(ran.var.mat.std*wgt.vec[1:npc.in])
+  std.prop.var <- prop.var/sum(prop.var)
+  std.prop.var
+}
+
+PlotPVCA <- function(pvca.res, title){
+  plot.dat <- data.frame(eff=names(pvca.res), prop=pvca.res)
+  p <- ggplot2::ggplot(plot.dat, aes(x=eff, y=prop))
+  p <- p + ggplot2::ggtitle(title)
+  p <- p + ggplot2::geom_bar(stat="identity", fill="steelblue", colour="steelblue")
+  p <- p + ggplot2::geom_text(aes(label=round(prop,3), y=prop+0.04), size=4)
+  p <- p + ggplot2::scale_x_discrete(limits=names(pvca.res))
+  p <- p + ggplot2::scale_y_continuous(limits = c(0,1))
+  p <- p + ggplot2::labs(x= "Effects", y= "Weighted average proportion variance")
+  p <- p + ggplot2::theme_bw()
+  p <- p + ggplot2::theme(plot.background = element_blank() ,panel.grid.major = element_blank(),
+                 panel.grid.minor = element_blank() ,panel.border = element_blank(), panel.background = element_blank())
+  p <- p + ggplot2::theme(axis.line = element_line(color = 'black'))
+  p <- p + ggplot2::theme(axis.title.x = element_text(size = 15, vjust=-0.5))
+  p <- p + ggplot2::theme(axis.title.y = element_text(size = 15, vjust= 1.0))
+  p <- p + ggplot2::theme(axis.text = element_text(size = 12))
+  p <- p + ggplot2::theme(axis.text.x = element_text(angle = 90, vjust= 0.5, hjust=1))
+  p
+}
+```
+
+```{r EDA}
+se.flow <- ds.ma[['Flow.cytometry']]
+
+flow.df <- assay(se.flow, 'Unstimulated') %>% 
+  as.data.frame() %>% 
+  filter(rowMeans(. < 0, na.rm = T) < 0.1) %>%  # remove flow gates with more 10% negative values (compensation problem)
+  log1p() %>% 
+  filter(rowMeans(is.na(.)) < 1/3) %>% # remove flow gates with more 1/3 NA
+  t() %>% 
+  as.data.frame() %>%  
+  mutate_all(~ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x))
+
+## PCA
+autoplot(prcomp(log1p(flow.df), scale. = T), 
+         data = as.data.frame(colData(se.flow)), fill = 'DS', shape = 21, size = 3,
+         names = T, alpha = 0.8) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Flow cytometry')+
+  theme_bw()
+
+### PVCA ----
+metadata <- colData(se.flow) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid') %>% 
+  mutate(BMI = ifelse(BMI < 5, NA, BMI)) %>% 
+  mutate(bmi_category = case_when(BMI < 18.5 ~ 'underweight',
+                                  BMI >= 18.5 & BMI < 25 ~ 'healthy',
+                                  BMI >= 25 & BMI < 30 ~ 'overweight',
+                                  BMI >= 30 ~ 'obesity',
+                                  TRUE ~ NA_character_)) %>% 
+  mutate(age_category = case_when(Age < 30 ~ 'under_30',
+                                  TRUE ~ 'over_30')) %>% 
+  column_to_rownames('sampleid') %>% 
+  select(DS, age_category, bmi_category, Sex)
+
+pvca <- PVCA(t(flow.df), meta = metadata, threshold = 0.1, inter = F)
+pvca.plot <- PlotPVCA(pvca, title = 'PVCA - Flow cytometry')
+
+eset <- ExpressionSet(assayData = t(flow.df)[,rownames(metadata)], 
+                      phenoData = AnnotatedDataFrame(metadata))
+
+batch.factors <- c('DS', 'age_category', 'bmi_category', 'Sex')
+
+pvca <- pvcaBatchAssess(eset, batch.factors = batch.factors, threshold = 0.1)
+
+df <- data.frame("Prop_var" = pvca$dat[1,], "condition" = pvca$label) %>%
+          arrange(desc(Prop_var))
+
+pvca.flow <- ggplot(df, aes(x = reorder(condition,Prop_var), 
+                                   y = Prop_var)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Condition",
+         y = "Proportion of variance explained") +
+    theme_bw() +
+    coord_flip()
+
+#ggsave('results/flow_cytometry/PVCA_flow.pdf', pvca.flow,
+#       device = 'pdf', scale = 0.4)
+
+### Linear regression DS vs HC
+flow.df <- assay(se.flow, 'Unstimulated') %>% 
+  as.data.frame() %>% 
+  filter(rowMeans(. < 0, na.rm = T) < 0.1) %>%  # remove flow gates with more 10% negative values (compensation problem)
+  log1p() %>% 
+  filter(rowMeans(is.na(.)) < 1/3) %>% # remove flow gates with more 1/3 NA
+  as.matrix()
+
+designMat <- model.matrix(~ DS, data = metadata)
+
+fit1 <- lmFit(flow.df[,rownames(metadata)], design = designMat)
+fit2 <- eBayes(fit1)
+top.ds <- topTable(fit2, coef=2, n = Inf, sort.by="none") %>% 
+  arrange(adj.P.Val) %>% 
+  rownames_to_column('feature')
+
+summary(decideTests(fit2))
+
+write_tsv(top.ds, 'results/flow_cytometry/limma_DS_vs_HC_flow.tsv')
+
+top.features <- top.ds %>%
+  filter(adj.P.Val < 0.05, abs(logFC) > 1) %>% 
+  select(feature) %>% 
+  deframe()
+
+ds.group <- c("#0D0887FF", "#F0F921FF")
+names(ds.group) <- c('no', 'yes')
+
+annotCol = list(DS = ds.group)
+
+pheatmap::pheatmap(flow.df[top.features,], scale = 'row',
+                   color = colorRampPalette(c('darkblue', 'blue', 'white', 
+                                              'red', 'darkred'))(100),
+                   show_colnames = F, annotation_col = metadata,
+                   annotation_colors = annotCol)
+
+```
+

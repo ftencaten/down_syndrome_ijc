@@ -1,0 +1,738 @@
+---
+title: "Down syndrome - IJC/Brazil"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Libraries}
+library(tidyverse)
+library(ggfortify)
+library(pheatmap)
+```
+
+```{r Files}
+clinical <- readxl::read_excel('data/clinical/20220821_Red Cap 25 junho _Susan_SPR.xlsx',
+                               skip = 1) %>% 
+  janitor::clean_names()
+
+msd.stim <- readxl::read_excel('data/cytokines_msd/20230505_DS_flat_correct_SPR.xlsx',
+                                      sheet = 'Flat Corrected')
+clinical.stim <- read_csv('data/cytokines_msd/clindata DS.csv')
+
+msd <- read_tsv('data/cytokines_msd/20220929_MSD_DS_PR_Flat inicial.tsv')
+```
+
+```{r Pre-processing}
+clinical.df <- clinical %>% 
+  mutate(etiqueta_coleta_de_sangue_1_2 = sub('-', '/', 
+                                             etiqueta_coleta_de_sangue_1_2)) %>% 
+  mutate(patientid = sub('.*/', '', etiqueta_coleta_de_sangue_1_2)) %>% 
+  select(patientid, sd, idade, qual_o_seu_peso_kg, qual_a_sua_altura_metros,
+         sexo)
+
+clinical.rename <- clinical %>%
+  select(etiqueta_coleta_de_sangue_2_1, etiqueta_coleta_de_sangue_1_2,
+         sd, idade, qual_o_seu_peso_kg, qual_a_sua_altura_metros, sexo) %>% 
+  pivot_longer(-c(sd, idade, qual_o_seu_peso_kg, 
+                  qual_a_sua_altura_metros, sexo)) %>% 
+  filter(!grepl('not_re_collected', value)) %>% 
+  mutate(value = sub('-', '/', value)) %>% 
+  mutate(patientid = sub('.*/', '', value)) %>% 
+  mutate(patientid = sub(' \\(.*', '', patientid)) %>% 
+  mutate(patientid = sub('03 ', '', patientid)) %>% 
+  select(-c(name, value)) %>% 
+  relocate(patientid, sexo) %>% 
+  unique()
+  
+msd.df <- msd %>% 
+  mutate(Sample = sub('-', '_', sub(' ', '_', Sample))) %>% 
+  separate(Sample, c('patientid', 'visit'), sep = '_') %>% 
+  mutate(visit = ifelse(visit == '09/02/21', '09/02/22', visit)) %>% 
+  mutate(visit = case_when(grepl('(/21|/22)', visit) ~ visit,
+                            is.na(visit) ~ NA_character_,
+                           TRUE ~ paste0(visit, '/21'))) %>% 
+  dplyr::rename(visit_day = visit) %>% 
+  mutate(patientid = sub('^0', '', sub('/', '', patientid)))
+
+# Join msd 
+msd.clinical <- msd.df %>% 
+  left_join(clinical.rename) %>% 
+  mutate(visit = ifelse(grepl('/22$', visit_day), 2, 1)) %>% 
+  mutate(visit = as.factor(visit)) %>% 
+  relocate(patientid, visit, visit_day, sexo, sd, idade, qual_o_seu_peso_kg,
+           qual_a_sua_altura_metros) 
+
+## Correct MSD Stim measure by cell number
+
+```
+
+```{r Linear regression - Limma}
+msd.clinical.df <- msd.clinical %>% 
+  mutate(sampleid = paste(patientid, visit, sep = '_')) %>% 
+  column_to_rownames('sampleid')
+
+df <- log1p(msd.clinical.df[msd.clinical.df$visit == 2,-c(1:8)])
+msd.outlier <- mt::pca.outlier(df)
+
+# remove outliers based on pca results
+msd.visit2 <- msd.clinical.df[msd.clinical.df$visit == 2, -c(1:8)] %>% 
+  rownames_to_column('id') %>% 
+  filter(!(id %in% names(msd.outlier$outlier))) %>% 
+  column_to_rownames('id') %>% 
+  as.matrix()
+
+pheno <- msd.clinical.df[rownames(msd.visit2), c(1:8)] 
+
+eset <- ExpressionSet(assayData = log1p(t(msd.visit2)),
+                      phenoData = AnnotatedDataFrame(pheno))
+
+designMat <- model.matrix(~ sd + sexo + idade, data = pData(eset))
+
+fit1 <- lmFit(eset, design = designMat)
+fit2 <- eBayes(fit1)
+
+top.sd <- topTable(fit2, coef=2, n = Inf, sort.by="none") 
+  
+top.sex <- topTable(fit2, coef=3, n = Inf, sort.by="none")
+
+summary(decideTests(fit2))
+
+out.df <- topTable(fit2, coef=2, n = Inf, sort.by="none") %>% 
+  arrange(P.Value) %>% 
+  rownames_to_column('Cytokine')
+
+#write_tsv(out.df, 'results/cytokines/linear_regression_DS_vs_HC_cytokines.tsv')
+
+# DS effect
+# Heatmap
+visit2.signif.df <- log1p(msd.clinical.df[rownames(msd.visit2),
+                                          rownames(top.sd[top.sd$adj.P.Val<0.05,])])
+
+visit2.pheno <- msd.clinical.df[rownames(msd.visit2), 1:8] %>% 
+  arrange(sd, sexo, idade) %>% 
+  dplyr::rename(Group = sd, Sex = sexo, Age_years = idade) %>% 
+  mutate(Group = ifelse(Group == 'sim', 'DS', 'HC')) %>% 
+  mutate(Sex = ifelse(Sex == 'Feminino', 'Female', 'Male'))
+
+ds.group <- c("#0D0887FF", "#F0F921FF")
+names(ds.group) <- c('HC', 'DS')
+
+annotCol = list(Group = ds.group)
+
+pheatmap(t(visit2.signif.df[rownames(visit2.pheno),]), scale = 'row',
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = visit2.pheno[,5, drop = F], cluster_cols = F,
+         show_colnames = F, cellwidth = 2, cellheight = 8, fontsize = 8,
+         annotation_colors = annotCol)
+
+# Volcano plot
+signif.up <- top.sd %>% 
+  filter(adj.P.Val < 0.05, logFC > 0) 
+
+signif.down <- top.sd %>% 
+  filter(adj.P.Val < 0.05, logFC < 0) 
+
+volcano.cytokines <- top.sd %>% 
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(alpha = 0.5) +
+  geom_point(data = signif.up, color = "red", size = 2) +
+  geom_point(data = signif.down, color = "blue", size = 2) +
+  geom_hline(yintercept = -log10(0.05), linetype = 2) +
+  geom_segment(aes(x = 0.5, y = 11.5, xend = 1, yend = 11.5),
+                  arrow = arrow(length = unit(0.2, "cm"))) +
+  annotate("label", label = "Down Syndrome", 
+           x = 0.75, y = 10.5, size = 2, colour = "black") +
+  geom_segment(aes(x = -0.5, y = 11.5, xend = -1, yend = 11.5),
+                  arrow = arrow(length = unit(0.2, "cm"))) +
+  annotate("label", label = "Healthy Control", 
+           x = -0.75, y = 10.5, size = 2, colour = "black") +
+  scale_x_continuous(limits = c(-1.5,1.5))+
+  theme_bw() +
+  theme(axis.text = element_text(size = 10), 
+        axis.title = element_text(size = 10))
+
+#ggsave('results/cytokines/figures/volcano_plot_visit2.pdf',
+#       volcano.cytokines, device = 'pdf', scale = 0.3)
+
+signif.names <- top.sd %>% 
+  filter(adj.P.Val < 0.05) %>% 
+  rownames_to_column('cytokine')
+
+volcano.cytokines.label <- top.sd %>% 
+  rownames_to_column('cytokine') %>% 
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(alpha = 0.5) +
+  geom_point(data = signif.up, color = "red", size = 2) +
+  geom_point(data = signif.down, color = "blue", size = 2) +
+  geom_label_repel(data = signif.names,
+                   aes(label = cytokine),  
+                   min.segment.length = 0, size = 2) + 
+  geom_hline(yintercept = -log10(0.05), linetype = 2) +
+  geom_segment(aes(x = 0.5, y = 11.5, xend = 1, yend = 11.5),
+                  arrow = arrow(length = unit(0.2, "cm"))) +
+  annotate("label", label = "Down Syndrome", 
+           x = 0.75, y = 10.5, size = 2, colour = "black") +
+  geom_segment(aes(x = -0.5, y = 11.5, xend = -1, yend = 11.5),
+                  arrow = arrow(length = unit(0.2, "cm"))) +
+  annotate("label", label = "Healthy Control", 
+           x = -0.75, y = 10.5, size = 2, colour = "black") +
+  scale_x_continuous(limits = c(-1.5,1.5))+
+  theme_bw() +
+  theme(axis.text = element_text(size = 10), 
+        axis.title = element_text(size = 10))
+
+#ggsave('results/cytokines/figures/volcano_plot_visit2_labels.pdf',
+#       volcano.cytokines.label, device = 'pdf', scale = 0.4)
+
+# Sex effect
+visit2.signif.df <- log1p(msd.clinical.df[msd.clinical.df$visit == 2,
+                                          rownames(top.sex[top.sex$adj.P.Val<0.05,])])
+
+visit2.pheno <- msd.clinical.df[msd.clinical.df$visit == 2, 1:8] %>% 
+  arrange(sexo, sd, idade) %>% 
+  dplyr::rename(Group = sd, Sex = sexo, Age_years = idade) %>% 
+  mutate(Group = ifelse(Group == 'sim', 'DS', 'HC')) %>% 
+  mutate(Sex = ifelse(Sex == 'Feminino', 'Female', 'Male'))
+  
+
+pheatmap(t(visit2.signif.df[rownames(visit2.pheno),]), scale = 'row',
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = visit2.pheno[,c(4:6)], cluster_cols = F,
+         show_colnames = F, cellwidth = 2, cellheight = 8, fontsize = 8)
+
+```
+
+```{r PCA}
+## MSD Plasma ----
+msd.clinical.df <- msd.clinical %>% 
+  mutate(sampleid = paste(patientid, visit, sep = '_')) %>% 
+  column_to_rownames('sampleid')
+
+# Visit 1 & 2
+pca.plasma <- autoplot(prcomp(log1p(msd.clinical.df[,-c(1:8)]), scale. = T), 
+         data = msd.clinical.df[, 1:8], fill = 'sd', shape = 21, size = 3,
+         names = T, alpha = 0.8) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines')+
+  theme_bw()
+
+#ggsave('results/figures/pca_plasma_cytokines.pdf', pca.plasma, 
+#       device = 'pdf', scale = 0.5)
+
+pca.plasma.loadings <- autoplot(prcomp(log1p(msd.clinical.df[,-c(1:8)]), scale. = T), 
+         data = msd.clinical.df[, 1:8], fill = 'sd', shape = 21, size = 3,
+         names = T, alpha = 0.2, loadings.label = T, loadings.label.repel = T,
+         loadings.label.size = 1.5) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines')+
+  theme_bw()
+
+#ggsave('results/figures/pca_plasma_cytokines_with_Loadings.pdf', pca.plasma.loadings, 
+#       device = 'pdf', scale = 0.5)
+
+# Visit 1
+pca_plasma_visit1 <- prcomp(log1p(msd.clinical.df[msd.clinical.df$visit == 1,-c(1:8)]), scale. = T)
+
+pca_plot_plasma_visit1 <- autoplot(pca_plasma_visit1, 
+         data = msd.clinical.df[msd.clinical.df$visit == 1, 1:8], fill = 'sd', 
+         shape = 21, size = 3, names = T, alpha = 0.8) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines - Visit 1')+
+  theme_bw()
+
+#ggsave('results/figures/pca_plasma_cytokines_Visit1.pdf', pca_plot_plasma_visit1, 
+#       device = 'pdf', scale = 0.5)
+
+pca_plot_plasma_visit1_loadings <- autoplot(pca_plasma_visit1, 
+         data = msd.clinical.df[msd.clinical.df$visit == 1, 1:8], fill = 'sd', 
+         shape = 21, size = 3, names = T, alpha = 0.2, loadings.label = T, 
+         loadings.label.repel = T, loadings.label.size = 1.5) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines - Visit 1')+
+  theme_bw()
+
+#ggsave('results/figures/pca_plasma_cytokines_Visit1_with_loadings.pdf',     
+#       pca_plot_plasma_visit1_loadings, device = 'pdf', scale = 0.5)
+
+# Visit 2
+df <- log1p(msd.clinical.df[msd.clinical.df$visit == 2,-c(1:8)])
+
+pca_plasma_visit2 <- prcomp(df, scale. = T)
+
+pca_plot_plasma_visit2 <- autoplot(pca_plasma_visit2, 
+         data = msd.clinical.df[msd.clinical.df$visit == 2, 1:8], fill = 'sd', 
+         shape = 21, size = 3, names = T, alpha = 0.8) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines - Visit 2')+
+  theme_bw()
+
+#ggsave('results/figures/pca_plasma_cytokines_Visit2.pdf', pca_plot_plasma_visit2, 
+#       device = 'pdf', scale = 0.5)
+
+## removing outliers
+df <- log1p(msd.clinical.df[msd.clinical.df$visit == 2,-c(1:8)])
+mt::pca.outlier(df)
+
+to.remove <- which(rownames(df) %in% c('244_2', '203_2', '263_2', '273_2'))
+
+pca_plasma_visit2 <- prcomp(df[-to.remove,], scale. = T)
+
+pca_plot_plasma_visit2 <- autoplot(pca_plasma_visit2, 
+         data = msd.clinical.df[rownames(df[-to.remove,]), 1:8], fill = 'sd', 
+         shape = 21, size = 3, names = T, alpha = 0.8) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines - Visit 2')+
+  theme_bw()
+
+#ggsave('results/cytokines/figures/pca_plasma_cytokines_Visit2_NoOutliers.pdf', 
+#       pca_plot_plasma_visit2, device = 'pdf', scale = 0.5)
+
+pca_plot_plasma_visit2_loadings <- autoplot(pca_plasma_visit2, 
+         data = msd.clinical.df[rownames(df[-to.remove,]), 1:8], fill = 'sd', 
+         shape = 21, size = 3, names = T, alpha = 0.2, loadings.label = T, 
+         loadings.label.repel = T, loadings.label.size = 1.5) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines - Visit 2')+
+  theme_bw()
+
+ggsave('results/cytokines/figures/pca_plasma_cytokines_Visit2_NoOutliers_with_loadings.pdf', 
+       pca_plot_plasma_visit2_loadings, device = 'pdf', scale = 0.5)
+
+## MSD Stim ----
+msd.clinical.stim.df <- msd.stim %>% 
+  left_join(clinical.stim %>% select(Sample, prism_ID_merge),
+            by = c('Sample#_well_stim' = 'Sample')) %>% 
+  mutate(prism_ID_merge = sub('_.*', '', prism_ID_merge)) %>% 
+  dplyr::rename(patientid = prism_ID_merge) %>% 
+  left_join(clinical.rename) %>% 
+  relocate(sample_number, patientid, sexo, sd, idade, qual_o_seu_peso_kg,
+           qual_a_sua_altura_metros) %>% 
+  column_to_rownames('Sample#_well_stim') %>% 
+  filter(!is.na(sd)) 
+
+pca.results <- prcomp(log1p(msd.clinical.stim.df[,-c(1:12)]), scale. = T)
+
+pca.stim <- autoplot(pca.results, 
+         data = msd.clinical.stim.df[, 1:12], 
+         fill = 'sd', shape = 'stim', size = 2, alpha = 0.8) +
+  scale_shape_manual(values = c(21,22,24), name = 'Stimulus') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw()
+
+#ggsave('results/figures/pca_stim_corrected_cellnumber.pdf', 
+#       pca.stim, scale = 0.5, device = 'pdf')
+
+pca.stim.loadings <- autoplot(pca.results, 
+         data = msd.clinical.stim.df[, 1:12], 
+         fill = 'sd', shape = 'stim', size = 2, alpha = 0.1, 
+         loadings.label = T,
+         loadings.label.repel = T, loadings.label.size = 1.5) +
+  scale_shape_manual(values = c(21,22,24), name = 'Stimulus') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw()
+
+#ggsave('results/figures/pca_stim_with_loadings_corrected_cellnumber.pdf', 
+#       pca.stim.loadings, scale = 0.5,  device = 'pdf')
+
+library(pheatmap)
+df <- log1p(msd.clinical.stim.df[,-c(1:12)])
+pheno <- msd.clinical.stim.df[, 1:12] %>% 
+  arrange(stim, sd)
+
+pheatmap(t(df[rownames(pheno),]), scale = 'row', 
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = pheno[,c(4,12)], cluster_cols = F,
+         show_colnames = F, cellwidth = 1.5, cellheight = 10, fontsize = 10)
+
+## MSD Stim - TCR ----
+tcr <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'TCR', -c(1:12)]
+tcr <- tcr[, -which(apply(tcr, 2, var) == 0)]
+
+pca.results.tcr <- prcomp(log1p(tcr), scale. = T)
+
+pca.stim.tcr <- autoplot(pca.results.tcr, 
+         data = msd.clinical.stim.df[msd.clinical.stim.df$stim == 'TCR', 1:12], 
+         fill = 'sd', shape = 'stim', size = 2, alpha = 0.8) +
+  scale_shape_manual(values = 22, name = 'Stimulus') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw()
+
+#ggsave('results/figures/pca_stim_TCR_corrected_cellnumber.pdf', 
+#       pca.stim.tcr, scale = 0.5, device = 'pdf')
+
+pca.stim.tcr.loadings <- autoplot(pca.results.tcr, 
+         data = msd.clinical.stim.df[msd.clinical.stim.df$stim == 'TCR', 1:12], 
+         fill = 'sd', shape = 'stim', size = 2, alpha = 0.1, 
+         loadings.label = T,
+         loadings.label.repel = T, loadings.label.size = 1.5) +
+  scale_shape_manual(values = 22, name = 'Stimulus') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw()
+
+#ggsave('results/figures/pca_stim_TCR_with_loadings_corrected_cellnumber.pdf', 
+#       pca.stim.tcr.loadings, scale = 0.5,  device = 'pdf')
+
+## MSD Stim - LPS ----
+lps <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'LPS', -c(1:12)]
+
+pca.results.lps <- prcomp(log1p(lps), scale. = T)
+
+pca.stim.lps <- autoplot(pca.results.lps, 
+         data = msd.clinical.stim.df[msd.clinical.stim.df$stim == 'LPS', 1:12], 
+         fill = 'sd', shape = 'stim', size = 2, alpha = 0.8) +
+  scale_shape_manual(values = 21, name = 'Stimulus') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw()
+
+#ggsave('results/figures/pca_stim_LPS_corrected_cellnumber.pdf', 
+#       pca.stim.lps, scale = 0.5, device = 'pdf')
+
+pca.stim.lps.loadings <- autoplot(pca.results.lps, 
+         data = msd.clinical.stim.df[msd.clinical.stim.df$stim == 'LPS', 1:12], 
+         fill = 'sd', shape = 'stim', size = 2, alpha = 0.1, 
+         loadings.label = T,
+         loadings.label.repel = T, loadings.label.size = 1.5) +
+  scale_shape_manual(values = 21, name = 'Stimulus') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw()
+
+#ggsave('results/figures/pca_stim_LPS_with_loadings_corrected_cellnumber.pdf', 
+#       pca.stim.lps.loadings, scale = 0.5,  device = 'pdf')
+
+## MSD Stim - Unstim ----
+unstim <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'Unstim', -c(1:12)]
+unstim <- unstim[, -which(apply(unstim, 2, var) == 0)]
+
+pca.results.unstim <- prcomp(log1p(unstim), scale. = T)
+
+pca.stim.unstim <- autoplot(pca.results.unstim, 
+         data = msd.clinical.stim.df[msd.clinical.stim.df$stim == 'Unstim', 1:12], 
+         fill = 'sd', shape = 'stim', size = 2, alpha = 0.8) +
+  scale_shape_manual(values = 24, name = 'Stimulus') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw()
+
+#ggsave('results/figures/pca_stim_Unstim_corrected_cellnumber.pdf', 
+#       pca.stim.unstim, scale = 0.5, device = 'pdf')
+
+pca.stim.unstim.loadings <- autoplot(pca.results.unstim, 
+         data = msd.clinical.stim.df[msd.clinical.stim.df$stim == 'Unstim', 1:12], 
+         fill = 'sd', shape = 'stim', size = 2, alpha = 0.1, 
+         loadings.label = T,
+         loadings.label.repel = T, loadings.label.size = 1.5) +
+  scale_shape_manual(values = 24, name = 'Stimulus') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw()
+
+#ggsave('results/figures/pca_stim_Unstim_with_loadings_corrected_cellnumber.pdf', 
+#       pca.stim.unstim.loadings, scale = 0.5,  device = 'pdf')
+
+### Gap statistic ----
+# TCR
+tcr <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'TCR', -c(1:12)]
+tcr <- tcr[, -which(apply(tcr, 2, var) == 0)]
+
+pheno <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'TCR', 1:12] %>% 
+  arrange(sd, idade)
+
+pheatmap(t(log1p(tcr[rownames(pheno), ])), scale = 'row', cluster_cols = F,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         show_colnames = F, annotation_col = pheno[, 4:5])
+
+gap_stat <- clusGap(t(tcr), FUN = kmeans, K.max =  ncol(tcr)-1, B = 500)
+fviz_gap_stat(gap_stat, maxSE = list(method = "firstSEmax"))
+set.seed(123)
+km.tcr <- kmeans(t(tcr), 4, nstart = 25)
+
+## LPS
+lps <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'LPS', -c(1:12)]
+
+pheno <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'LPS', 1:12] %>% 
+  arrange(sd, idade)
+
+pheatmap(t(log1p(lps[rownames(pheno), ])), scale = 'row', cluster_cols = F,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         show_colnames = F, annotation_col = pheno[, 4:5])
+
+gap_stat <- clusGap(t(lps), FUN = kmeans, K.max =  ncol(lps)-1, B = 500)
+fviz_gap_stat(gap_stat, maxSE = list(method = "firstSEmax"))
+set.seed(123)
+km.lps <- kmeans(t(lps), 8, nstart = 25)
+
+## Unstim
+unstim <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'Unstim', -c(1:12)]
+unstim <- unstim[, -which(apply(unstim, 2, var) == 0)]
+
+pheno <- msd.clinical.stim.df[msd.clinical.stim.df$stim == 'Unstim', 1:12] %>% 
+  arrange(sd, idade)
+
+pheatmap(t(log1p(unstim[rownames(pheno), ])), scale = 'row', cluster_cols = F,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         show_colnames = F, annotation_col = pheno[, 4:5])
+
+gap_stat <- clusGap(t(unstim), FUN = kmeans, K.max =  ncol(unstim)-1, B = 500)
+fviz_gap_stat(gap_stat, maxSE = list(method = "firstSEmax"))
+set.seed(123)
+km.unstim <- kmeans(t(unstim), 8, nstart = 25)
+
+
+## Join cluster gap statistic
+msd_cluster <- enframe(km.tcr$cluster, value = 'TCR_Cluster') %>% 
+  full_join(enframe(km.lps$cluster, value = 'LPS_Cluster')) %>% 
+  full_join(enframe(km.unstim$cluster, value = 'Unstim_Cluster')) %>% 
+  dplyr::rename(Cytokine = name)
+
+write_tsv(msd_cluster, 'results/MSD_Cluster.tsv')
+
+### Wilcoxon test ----
+### Test cytokines levels between groups
+to.remove <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  group_by(name, stim, sd) %>% 
+  dplyr::count(value > 0) %>% 
+  filter(`value > 0` == F, n > 61) %>% 
+  ungroup() %>% 
+  select(name, stim)
+
+msd.stim.stat <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  anti_join(to.remove) %>% 
+  group_by(name, stim) %>% 
+  wilcox_test(value ~ sd) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  arrange(p)
+
+#write_tsv(msd.stim.stat, 'results/wilcoxon_test_Cytokines_stim.tsv')
+
+### Adjusted p-value < 0.05 ----
+msd.stim.stat.signif <- msd.stim.stat %>% filter(p.adj < 0.05)
+
+tcr.stim <- msd.stim.stat %>% filter(p.adj < 0.05, stim == 'TCR')
+lps.stim <- msd.stim.stat %>% filter(p.adj < 0.05, stim == 'LPS')
+unstim.stim <- msd.stim.stat %>% filter(p.adj < 0.05, stim == 'Unstim')
+
+tcr.plot <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  filter(stim == 'TCR', name %in% tcr.stim$name) %>% 
+  ggplot(aes(x = sd, y = log10(value+1), fill = sd)) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~name, scales = 'free_y') +
+  stat_compare_means(method = 'wilcox', comparisons = list(c("sim", "não"))) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), guide = 'none') +
+  scale_x_discrete(label = c('HC', 'DS')) + 
+  labs(y = 'pg/mL (log10+1)', x = '') +
+  ggtitle('TCR Stimulus')+
+  theme_bw()
+
+#ggsave('results/figures/boxplot_signif_cytokines_TCR.pdf', tcr.plot,
+#       device = 'pdf', width = 3.5, height = 6)
+
+lps.plot <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  filter(stim == 'LPS', name %in% lps.stim$name) %>% 
+  ggplot(aes(x = sd, y = log10(value+1), fill = sd)) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~name, scales = 'free_y')+
+  stat_compare_means(method = 'wilcox', comparisons = list(c("sim", "não"))) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), guide = 'none') +
+  scale_x_discrete(label = c('HC', 'DS')) + 
+  labs(y = 'pg/mL (log10+1)', x = '') +
+  ggtitle('LPS Stimulus')+
+  theme_bw()
+
+#ggsave('results/figures/boxplot_signif_cytokines_LPS.pdf', lps.plot,
+#       device = 'pdf', width = 3.5, height = 4.5)
+
+unstim.plot <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  filter(stim == 'Unstim', name %in% unstim.stim$name) %>% 
+  ggplot(aes(x = sd, y = log10(value+1), fill = sd)) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~name, scales = 'free_y')+
+  stat_compare_means(method = 'wilcox', comparisons = list(c("sim", "não"))) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), guide = 'none') +
+  scale_x_discrete(label = c('HC', 'DS')) + 
+  labs(y = 'pg/mL (log10+1)', x = '') +
+  ggtitle('Unstim')+
+  theme_bw()
+
+#ggsave('results/figures/boxplot_signif_cytokines_Unstim.pdf', unstim.plot,
+#       device = 'pdf', width = 1.5, height = 2.5)
+
+### p-value < 0.05 ----
+msd.stim.stat.signif <- msd.stim.stat %>% filter(p < 0.05)
+
+tcr.stim <- msd.stim.stat %>% filter(p < 0.05, stim == 'TCR')
+lps.stim <- msd.stim.stat %>% filter(p < 0.05, stim == 'LPS')
+unstim.stim <- msd.stim.stat %>% filter(p < 0.05, stim == 'Unstim')
+
+tcr.plot <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  filter(stim == 'TCR', name %in% tcr.stim$name) %>% 
+  ggplot(aes(x = sd, y = log10(value+1), fill = sd)) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~name, scales = 'free_y', nrow = 3) +
+  stat_compare_means(method = 'wilcox', comparisons = list(c("sim", "não"))) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), guide = 'none') +
+  scale_x_discrete(label = c('HC', 'DS')) + 
+  labs(y = 'pg/mL (log10+1)', x = '') +
+  ggtitle('TCR Stimulus')+
+  theme_bw()
+
+#ggsave('results/figures/boxplot_signif_cytokines_TCR_pvalue0.05.pdf', tcr.plot,
+#       device = 'pdf', width = 5.5, height = 6)
+
+lps.plot <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  filter(stim == 'LPS', name %in% lps.stim$name) %>% 
+  ggplot(aes(x = sd, y = log10(value+1), fill = sd)) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~name, scales = 'free_y', nrow = 3)+
+  stat_compare_means(method = 'wilcox', comparisons = list(c("sim", "não"))) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), guide = 'none') +
+  scale_x_discrete(label = c('HC', 'DS')) + 
+  labs(y = 'pg/mL (log10+1)', x = '') +
+  ggtitle('LPS Stimulus')+
+  theme_bw()
+
+#ggsave('results/figures/boxplot_signif_cytokines_LPS_pvalue0.05.pdf', lps.plot,
+#       device = 'pdf', width = 5.5, height = 6)
+
+unstim.plot <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  filter(stim == 'Unstim', name %in% unstim.stim$name) %>% 
+  ggplot(aes(x = sd, y = log10(value+1), fill = sd)) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~name, scales = 'free_y')+
+  stat_compare_means(method = 'wilcox', comparisons = list(c("sim", "não"))) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), guide = 'none') +
+  scale_x_discrete(label = c('HC', 'DS')) + 
+  labs(y = 'pg/mL (log10+1)', x = '') +
+  ggtitle('Unstim')+
+  theme_bw()
+
+#ggsave('results/figures/boxplot_signif_cytokines_Unstim_pvalue0.05.pdf', 
+#       unstim.plot, device = 'pdf', width = 4, height = 5)
+msd.stim.stat <- msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  anti_join(to.remove) %>% 
+  group_by(name, stim) %>% 
+  wilcox_test(value ~ sd) 
+  adjust_pvalue(p.col = 'p', method = 'BH', ) %>% 
+  add_xy_position(x = 'stim', y.trans = function(x){log10(x+1)}, 
+                  scales = 'free_y')
+
+msd.clinical.stim.df %>% 
+  pivot_longer(-c(1:12)) %>% 
+  filter(name %in% msd.stim.stat.signif$name) %>% 
+  ggplot(aes(x = stim, y = log10(value + 1))) +
+  geom_boxplot(aes(fill = sd), alpha = 0.8) +
+  stat_pvalue_manual(msd.stim.stat, label = "p", hide.ns = 'p', )+
+  facet_wrap(~name, scales = 'free_y', nrow = 3) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  labs(y = 'pg/mL (log10+1)', x = '') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+```{r Heatmap}
+# samples to exclude from dowstream analysis based on outlier detection on pca
+to.remove <- c('244_2', '203_2', '263_2', '273_2')
+
+msd.clinical.stat <- msd.clinical.df %>% 
+  rownames_to_column('sampleid') %>% 
+  filter(visit == 2, !(sampleid %in% to.remove)) %>% 
+  pivot_longer(-c(1:9), names_to = 'cytokine') %>% 
+  group_by(cytokine) %>% 
+  wilcox_test(value ~ sd, detailed = T) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  arrange(p)
+
+msd.clinical.stat.signif <- msd.clinical.stat %>% filter(p.adj < 0.05)
+
+significant_cytokines_plot <-msd.clinical.df %>% 
+  rownames_to_column('sampleid') %>% 
+  filter(visit == 2, !(sampleid %in% to.remove)) %>% 
+  pivot_longer(-c(1:9), names_to = 'cytokine') %>% 
+  filter(cytokine %in% msd.clinical.stat.signif$cytokine) %>% 
+  ggplot(aes(x = sd, y = log1p(value))) +
+  geom_boxplot(aes(fill = sd))+
+  facet_wrap(~cytokine, scales = 'free_y') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), guide = 'none')+
+  theme_bw() +
+  labs(y = 'Cytokine levels pg/ml log10(+1)', x = '') +
+  scale_x_discrete(labels = c('HC', 'DS')) 
+
+ggsave('results/cytokines/figures/boxplot_significant_cytokines_visit2_removing_outliers_samples.pdf',
+       significant_cytokines_plot, device = 'pdf', width = 6, height = 6)
+
+library(pheatmap)
+# MSD Plasma - Visit 2 
+visit2.df <- log1p(msd.clinical.df[msd.clinical.df$visit == 2,-c(1:8)])
+visit2.df <- visit2.df[,-which(colSums(visit2.df == 0) > nrow(visit2.df)/2)]
+
+visit2.pheno <- msd.clinical.df[msd.clinical.df$visit == 2, 1:8]
+
+pheatmap(t(visit2.df), scale = 'row',
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = visit2.pheno[,c(4:6)], cluster_cols = T,
+         show_colnames = F, cellwidth = 2, cellheight = 8, fontsize = 8)
+
+# MSD Plasma - Visit 2 - Significant cytokines
+true.samples <- msd.clinical.df %>% 
+  rownames_to_column('sampleid') %>% 
+  filter(visit == 2, !(sampleid %in% to.remove)) %>% 
+  select(sampleid) %>% 
+  deframe
+
+visit2.signif.df <- log1p(msd.clinical.df[true.samples,
+                                          msd.clinical.stat.signif$cytokine])
+
+visit2.pheno <- msd.clinical.df[true.samples, 1:8] %>% 
+  arrange(sd, sexo, idade) %>% 
+  dplyr::rename(Group = sd, Sex = sexo, Age_years = idade) %>% 
+  mutate(Group = ifelse(Group == 'sim', 'DS', 'HC')) %>% 
+  mutate(Sex = ifelse(Sex == 'Feminino', 'Female', 'Male'))
+
+ds.group <- c("#0D0887FF", "#F0F921FF")
+names(ds.group) <- c('HC', 'DS')
+
+colAnnot <- list(Group = ds.group)
+
+pheatmap(t(visit2.signif.df[rownames(visit2.pheno),]), scale = 'row',
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = visit2.pheno[, 5, drop = F], cluster_cols = F,
+         show_colnames = F, cellwidth = 2, cellheight = 8, fontsize = 8,
+         annotation_colors = colAnnot)
+```

@@ -1,0 +1,275 @@
+---
+title: "Multi-Omics Factor Analysis"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r load libraries}
+library(MultiAssayExperiment)
+library(MOFA2)
+library(DESeq2)
+library(tidyverse)
+```
+
+```{r load files}
+ds.ma <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+```
+
+```{r prepare data}
+### Bulk RNA-seq
+se.rnaseq <- ds.ma[['Bulk.RNAseq']]
+
+ddsSE <- DESeqDataSet(se.rnaseq, design = ~ ds)
+
+vst.rnaseq <- vst(ddsSE)
+
+hvg.rnaseq <- head(order(-rowVars(assay(vst.rnaseq))),5000)
+hvg.rnaseq.df <- assay(vst.rnaseq)[hvg.rnaseq, ]
+
+colnames(hvg.rnaseq.df) <- paste0(sub('.*_', '', colnames(hvg.rnaseq.df)), '_V2')
+rownames(hvg.rnaseq.df) <- rowData(vst.rnaseq)[rownames(hvg.rnaseq.df), 1]
+
+### Metabolites
+se.metab <- ds.ma[['Metabolites']]
+
+# Remove metabolites missing in more 50% samples
+metabs.to.remove <- which(rowMeans(is.na(assay(se.metab))) > 0.5)
+
+metabs.df <- log1p(assay(se.metab))[-metabs.to.remove,]
+rownames(metabs.df) <- rowData(se.metab)[rownames(metabs.df),11]
+
+### Cytokines
+se.cytok <- ds.ma[['MSD.plasma']]
+
+cytok.df <- log1p(se.cytok) %>% 
+  as.data.frame() %>% 
+  dplyr::select(ends_with('_V2')) %>% 
+  as.matrix()
+
+### Flow cytometry
+se.flow <- ds.ma[['Flow.cytometry']]
+
+flow.df <- assay(se.flow, 'Unstimulated') %>% 
+  as.data.frame() %>% 
+  filter(rowMeans(. < 0, na.rm = T) < 0.1) %>%  # remove flow gates with more 10% negative values (compensation problem)
+  log1p() %>% 
+  filter(rowMeans(is.na(.)) < 1/3) %>%  # remove flow gates with more 1/3 NA
+  as.matrix()
+
+### Create MOFA Object
+list.df <- list(cytok.df, 
+                metabs.df[, colnames(cytok.df)], 
+                hvg.rnaseq.df[, colnames(cytok.df)],
+                flow.df[, colnames(cytok.df)])
+
+names(list.df) <- c('cytokines', 'metabolites', 'rna.seq', 'flow')
+
+MOFAobject <- create_mofa(list.df)
+```
+
+```{r Train MOFA model}
+# data options
+data_opts <- get_default_data_options(MOFAobject)
+
+# model options
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors <- 15
+
+# training options
+train_opts <- get_default_training_options(MOFAobject)
+head(train_opts)
+
+# Prepare the MOFA object
+MOFAobject <- prepare_mofa(
+  object = MOFAobject,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+outfile = file.path('data/MOFA', "cytok_metab_rnaseq_model.hdf5")
+MOFAobject.trained <- run_mofa(MOFAobject, outfile, use_basilisk=TRUE)
+```
+
+```{r MOFA downstream analysis}
+MOFAobject.trained <- load_model("data/MOFA/cytok_metab_rnaseq_model.hdf5")
+
+data_overview <- plot_data_overview(MOFAobject.trained)
+#ggsave('results/data_overview_mofa.pdf', data_overview, scale = 0.5)
+
+plot_top_weights(MOFAobject.trained, view = "rna.seq",factor = 2, nfeatures = 50)
+
+plot_factors(MOFAobject.trained, factor = c(2,5), shape_by = 'ds', color_by = 'sex')
+
+# Add metadata
+sample_metadata <- colData(ds.ma) %>%
+  as.data.frame() %>%
+  rownames_to_column('sample') %>%
+  mutate(sample = paste0(sample, '_V2')) %>% 
+  filter(sample %in% samples_names(MOFAobject.trained)[[1]]) %>% 
+  select(sample, ds, age_years, sex)
+
+samples_metadata(MOFAobject.trained) <- sample_metadata 
+  
+# Variance decomposition
+head(MOFAobject.trained@cache$variance_explained$r2_total[[1]]) 
+
+head(MOFAobject.trained@cache$variance_explained$r2_per_factor[[1]])
+
+variance_explained <- plot_variance_explained(MOFAobject.trained, x="view", y="factor") +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+ggsave('results/variance_explained_mofa.pdf', variance_explained , height = 3, width = 3)
+
+variance_explained_by_view <- plot_variance_explained(MOFAobject.trained, plot_total = TRUE)[[2]]+
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+ggsave('results/variance_explained_ny_view_mofa.pdf', 
+       variance_explained_by_view , height = 2.5, width = 2)
+
+factor_annot <- plot_factor(MOFAobject.trained, 
+  factor = 1:10,
+  color_by = "ds",
+  shape_by = "sex"
+)
+
+ggsave('results/latent_factor_value.pdf', factor_annot, scale = 0.55)
+
+factors_value <- get_factors(MOFAobject.trained, as.data.frame = T) %>% 
+  left_join(sample_metadata) %>% 
+  mutate(sex = ifelse(sex == 'Female', 'F', 'M'))
+
+ds <- factors_value %>% 
+  filter(factor %in% paste0('Factor', 1:10)) %>% 
+  ggplot(aes(x = ds, y = value)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~factor, ncol = 10) +
+  stat_compare_means( hide.ns = T, label = 'p.signif', label.y = 3) +
+  labs(x = '', y  = 'Factor value')
+
+sex <- factors_value %>% 
+  filter(factor %in% paste0('Factor', 1:10)) %>% 
+  ggplot(aes(x = sex, y = value)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~factor, ncol = 10) +
+  stat_compare_means(hide.ns = T, label = 'p.signif', label.y = 3) +
+  labs(x = '', y  = 'Factor value')
+
+age <- factors_value %>% 
+  filter(factor %in% paste0('Factor', 1:10)) %>% 
+  ggplot(aes(x = age_years, y = value)) +
+  geom_point(size = 1) +
+  facet_wrap(~factor, ncol = 10) +
+  stat_cor(method = "spearman", size = 1.6) +
+  labs(x = '', y  = 'Factor value')
+
+p <- ds / sex/ age
+
+ggsave('results/factor_values_metadata.pdf', p)
+
+splot_factor(MOFAobject.trained, 
+  factor = 1:10,
+  color_by = "age_years",
+  shape_by = "sex"
+)
+
+cytokine_weights <- plot_weights(MOFAobject.trained,
+  view = "cytokines",
+  factor = 2,
+  nfeatures = 10,     # Number of features to highlight
+  scale = T,          # Scale weights from -1 to 1
+  abs = F             # Take the absolute value?
+)
+
+ggsave('results/cytokines_weights_factor2.pdf', cytokine_weights, height = 3.11, width = 5)
+
+cytokine_weights_top <- plot_top_weights(MOFAobject.trained, view = "cytokines",factor = 2, nfeatures = 10)
+
+ggsave('results/cytokines_top_weights_factor2.pdf', cytokine_weights_top, height = 3, width = 3)
+
+p <- plot_factors(MOFAobject.trained, 
+  factors = c(2,5), 
+  #color_by = "IGHV",
+  #shape_by = "trisomy12",
+  dot_size = 2.5,
+  show_missing = T
+)
+
+
+plot_weights(MOFAobject.trained,
+  view = "metabolites",
+  factor = 2,
+  nfeatures = 10,     # Number of features to highlight
+  scale = T,          # Scale weights from -1 to 1
+  abs = F             # Take the absolute value?
+)
+
+metabolites_weights_top <- plot_top_weights(MOFAobject.trained, view = "metabolites",
+                                            factor = 2, nfeatures = 10)
+
+ggsave('results/metabolites_top_weights_factor2.pdf', metabolites_weights_top , scale = 0.5)
+
+
+plot_weights(MOFAobject.trained,
+  view = "rna.seq",
+  factor = 2,
+  nfeatures = 4,     # Number of features to highlight
+  scale = T,          # Scale weights from -1 to 1
+  abs = F  # Take the absolute value?
+)
+
+genes_weights_top <- plot_top_weights(MOFAobject.trained, view = "rna.seq",
+                                            factor = 2, nfeatures = 10)
+
+ggsave('results/genes_top_weights_factor2.pdf', genes_weights_top , height = 2.83, width = 4)
+
+
+plot_weights(MOFAobject.trained,
+  view = "flow",
+  factor = 2,
+  nfeatures = 10,     # Number of features to highlight
+  scale = T,          # Scale weights from -1 to 1
+  abs = F  # Take the absolute value?
+)
+
+flow_weights_top <- plot_top_weights(MOFAobject.trained, view = "flow",
+                                            factor = 2, nfeatures = 10)
+
+ggsave('results/flow_top_weights_factor2.pdf', flow_weights_top , scale = 0.7)
+
+plot_data_heatmap(MOFAobject.trained,
+  view = "rna.seq",         # view of interest
+  factor = 2,             # factor of interest
+  features = 50,          # number of features to plot (they are selected by weight)
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, cluster_cols = T,
+  show_rownames = TRUE, show_colnames = FALSE
+)
+
+cp.gene_set <- msigdbr::msigdbr(category = 'C2') %>% 
+  filter(grepl('CP:', gs_subcat)) %>% 
+  dplyr::select(gs_name, gene_symbol) %>% 
+  mutate(value = 1) %>% 
+  unique %>% 
+  pivot_wider(names_from = gene_symbol, values_from = value, values_fill = 0) %>% 
+  column_to_rownames('gs_name') %>% 
+  as.matrix()
+
+enrichment.test <- MOFA2::run_enrichment(MOFAobject.trained, 
+                                         view = "rna.seq", factors = 2,
+                                         feature.sets = cp.gene_set)
+
+plot_enrichment(enrichment.test, 
+  factor = 1, 
+  max.pathways = 15
+)
+
+plot_enrichment_detailed(enrichment.test, 
+  factor = 1, 
+  max.genes = 1, 
+  max.pathways = 5
+)
+
+
+## Associations of latent factors to clinical behaviors
+
+```
+

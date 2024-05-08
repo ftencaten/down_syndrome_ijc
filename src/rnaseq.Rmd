@@ -1,0 +1,2013 @@
+---
+title: "Bulk rna-seq"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load libraries}
+library(tidyverse)
+library(ggpubr)
+library(ggfortify)
+library(DESeq2)
+library(limma)
+library(edgeR)
+library(circlize)
+library(clusterProfiler)
+```
+
+```{r Load files}
+ds.ma <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+
+se <- ds.ma[['Bulk.RNAseq']]
+```
+
+```{r CPM + PCA / PVCA}
+ddsSE <- DESeqDataSet(se, design = ~ ds)
+
+ddsSE <- estimateSizeFactors(ddsSE)
+
+cpm <- fpm(ddsSE)
+
+#keep <- which(rowSums(cpm > 0.1) > 6)
+#cpm.keep <- cpm[keep,]
+#write_tsv(cpm.keep %>% as.data.frame() %>%  rownames_to_column('genes'),
+#          'data/cpm_counts.tsv')
+
+### PCA ----
+
+V <- apply(cpm, 1, var)
+selectedGenes <- names(V[order(V, decreasing = T)][1:500])
+
+M <- t(cpm[selectedGenes,])
+M <- log1p(M)
+pcaResults <- prcomp(M, scale. = T)
+
+rnaseq.pca <- autoplot(pcaResults, data = as.data.frame(colData(se)), 
+                       fill = 'ds', size = 3, shape = 21) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  theme_bw()
+  
+#ggsave('results/rnaseq/figures/pca_ds_rnaseq.pdf', rnaseq.pca,
+#       device = 'pdf', scale = 0.5)
+
+### PVCA ----
+pheno <- as.data.frame(colData(se)) %>% 
+  mutate(age_group = ifelse(age_years >= 30, 'above_30', 'below_30'))
+
+keep <- which(rowSums(cpm > 0.1) > 15)
+cpm.keep <- cpm[keep,]
+
+rnaseq.eset <- ExpressionSet(assayData = cpm.keep, 
+                             phenoData = AnnotatedDataFrame(pheno))
+
+batch.factors <- c('ds', 'age_group', 'sex')
+
+pvca <- pvcaBatchAssess(rnaseq.eset, batch.factors = batch.factors, 
+                        threshold = 0.1)
+
+df <- data.frame("Prop_var" = pvca$dat[1,], "condition" = pvca$label) %>%
+          arrange(desc(Prop_var))
+
+rnaseq.pvca <- ggplot(df, aes(x = reorder(condition,Prop_var), y = Prop_var)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Condition",
+         y = "Proportion of variance explained") +
+    theme_bw() +
+    coord_flip()
+
+#ggsave('results/rnaseq/figures/pvca_ds_rnaseq.pdf', rnaseq.pvca, 
+#       device = 'pdf', scale = 0.4)
+```
+  
+```{r Variance partition}
+library(variancePartition)
+
+geneCounts <- assay(se) %>% 
+  as.data.frame()
+
+top.var.genes <- names(rev(sort(apply(geneCounts, 1, var))))[1:500]
+
+pheno <- as.data.frame(colData(se)) |> 
+  mutate(height_meter = case_when(height_meter == 0 ~ NA,
+                                  height_meter > 100  ~ height_meter/100,
+                                  TRUE ~ height_meter)) |> 
+  mutate(bmi = weight_kg/height_meter^2) |> 
+  mutate(bmi = ifelse(bmi < 10, NA, bmi))
+
+# identify genes that pass expression cutoff
+isexpr <- rowSums(cpm(geneCounts) > 1) >= 0.5 * ncol(geneCounts)
+
+# create data structure with only expressed genes
+gExpr <- DGEList(counts = geneCounts[isexpr, ], samples = pheno)
+#gExpr <- DGEList(counts = geneCounts[top.var.genes, ])
+
+# Perform TMM normalization
+gExpr <- calcNormFactors(gExpr)
+
+# Specify variables to be included in the voom() estimates of
+# uncertainty.
+# Recommend including variables with a small number of categories
+# that explain a substantial amount of variation
+design <- model.matrix(~ds, pheno)
+
+# Estimate precision weights for each gene and sample
+# This models uncertainty in expression measurements
+vobjGenes <- voom(gExpr, design)
+
+# Define formula
+form <- ~ ds +  sex + age_years + most_recent_event + bmi
+
+# variancePartition seamlessly deals with the result of voom()
+# by default, it seamlessly models the precision weights
+# This can be turned off with useWeights=FALSE
+varPart <- fitExtractVarPartModel(vobjGenes, form, pheno)
+
+vp <- sortCols(varPart)
+
+variance.plot <- plotVarPart(vp) 
+
+#ggsave('results/rnaseq/variance_explained_by_factor.pdf', variance.plot, scale = 0.5)
+
+### non-DS Control
+gExpr.nonds <- gExpr[,gExpr$samples$ds == 'no',]
+
+gExpr.nonds <- calcNormFactors(gExpr.nonds)
+
+design <- model.matrix(~sex, pheno[pheno$ds == 'no',])
+
+vobjGenes.nonds <- voom(gExpr.nonds, design)
+
+# Define formula
+form <- ~  sex + age_years + most_recent_event + bmi
+
+varPart.nonds <- fitExtractVarPartModel(vobjGenes.nonds , form, 
+                                        pheno[pheno$ds == 'no',])
+
+vp.nonds <- sortCols(varPart.nonds)
+
+nonds.variance.plot <- plotVarPart(vp.nonds) 
+
+ggsave('results/rnaseq/variance_explained_by_factor_nonDS.pdf', 
+       nonds.variance.plot, scale = 0.5)
+
+### individuals with DS
+gExpr.ds <- gExpr[,gExpr$samples$ds == 'yes',]
+
+gExpr.ds <- calcNormFactors(gExpr.ds)
+
+design <- model.matrix(~sex, pheno[pheno$ds == 'yes',])
+
+vobjGenes.ds <- voom(gExpr.ds, design)
+
+# Define formula
+form <- ~  sex + age_years + most_recent_event + bmi
+
+varPart.ds <- fitExtractVarPartModel(vobjGenes.ds , form, 
+                                     pheno[pheno$ds == 'yes',])
+
+vp.ds <- sortCols(varPart.ds)
+
+ds.variance.plot <- plotVarPart(vp.ds) 
+
+#ggsave('results/rnaseq/variance_explained_by_factor_DS.pdf', 
+#       ds.variance.plot, scale = 0.5)
+```
+
+```{r Differential expression - DS vs HC}
+library(biomaRt)
+
+mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene.annot <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                    filters = "ensembl_gene_id", 
+                    values = rownames(se), mart = mart)
+
+hgnc.annot <- gene.annot %>% 
+  filter(hgnc_symbol != '')
+
+count.matrix <- assay(se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('ensembl_gene_id') %>% 
+  right_join(hgnc.annot) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  distinct(hgnc_symbol, .keep_all = T) %>% 
+  column_to_rownames('hgnc_symbol')
+
+pheno <- as.data.frame(colData(se)) %>% 
+  mutate(ds = factor(ds, levels = c('no', 'yes'))) %>% 
+  mutate(age_scaled = scale(age_years)[,1])
+
+dds <- DESeqDataSetFromMatrix(countData = count.matrix,
+                              colData = pheno,
+                              design = ~ ds + sex + age_scaled)
+
+keep <- rowSums(counts(dds) >= 5) >= 15
+dds <- dds[keep,]
+
+dds <- DESeq(dds)
+resultsNames(dds)
+
+ds.degs <- as.data.frame(results(dds, name = 'ds_yes_vs_no')) %>% arrange(pvalue)
+
+ds.degs.shrink <- as.data.frame(lfcShrink(dds, coef="ds_yes_vs_no", type="apeglm")) %>% 
+  arrange(pvalue)
+
+ds.degs.shrink.df <- ds.degs.shrink %>% 
+  rownames_to_column('genesymbol')
+
+### Interaction
+# Sex
+dds.ds_sex_interaction <- DESeqDataSetFromMatrix(countData = count.matrix,
+                              colData = pheno,
+                              design = ~ ds*sex)
+
+keep <- rowSums(counts(dds.ds_sex_interaction) >= 5) >= 15
+dds.ds_sex_interaction <- dds.ds_sex_interaction[keep,]
+
+dds.ds_sex_interaction <- DESeq(dds.ds_sex_interaction)
+resultsNames(dds.ds_sex_interaction)
+
+ds.degs_sex_interaction <- as.data.frame(results(dds.ds_sex_interaction, 
+                                 name = 'dsyes.sexMale')) %>% arrange(pvalue)
+
+
+#write_tsv(ds.degs.shrink.df, 'results/rnaseq/degs_ds_vs_hc_ijc_cohort.tsv')
+
+ds.degs.up <- ds.degs.shrink.df %>%
+  filter(padj < 0.05, log2FoldChange > log2(1.25))
+
+ds.degs.down <- ds.degs.shrink.df %>%
+  filter(padj < 0.05, log2FoldChange < -log2(1.25))
+
+exhaustion.genes <- c('PDCD1', 'TIGIT', 'TOX', 'LAG3', 'HAVCR2')
+
+ds.label <- ds.degs.shrink.df %>%
+  filter(genesymbol %in% exhaustion.genes) |> 
+  mutate(genesymbol = ifelse(genesymbol == 'HAVCR2', 'TIM3', genesymbol))
+
+volcano.plot.exhaustion <- ds.degs.shrink.df %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_point(data = ds.degs.up, color = 'red') +
+  geom_point(data = ds.degs.down, color = 'blue') +
+  geom_label_repel(data = ds.label, aes(label = genesymbol), min.segment.length = 0) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12), axis.title = element_text(size = 13))+
+  labs(y = '-Log10 Adjusted P-value') +
+  ggtitle('DEGs Down syndrome')
+   
+ggsave('results/rnaseq/figures/volcano_plot_ds_exhaustion_markers.png', 
+       volcano.plot.exhaustion, scale = 0.5, dpi = 'retina')
+
+### Enrichment analysis
+library(clusterProfiler)
+dnmt3 <- read.gmt('data/rna-seq/gene_signatures/DNMT3A_signature_Feb2019.gmt') %>% 
+  filter(gene != '') |> 
+  rename(gs_name = term, gene_symbol = gene)
+
+exhaustion <- read.gmt('data/rna-seq/gene_signatures/PD1_Exhaustion.gmt') |> 
+  filter(gene != '') |> 
+  rename(gs_name = term, gene_symbol = gene)
+
+inflamassome_rv127 <- read.gmt('data/rna-seq/gene_signatures/Inflammasome and IL1 pathways_RV127.gmt') %>% 
+  filter(gene != '')
+
+interferome <- read.gmt('data/rna-seq/gene_signatures/Interferome_genelist.txt') %>% 
+  filter(gene != '')
+
+cp.gene_set <- msigdbr::msigdbr(category = 'C2') %>% 
+  filter(grepl('CP:', gs_subcat)) %>% 
+  dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+go.gene_set <- msigdbr::msigdbr(category = 'C5') |> 
+  filter(grepl('GO:BP', gs_subcat)) %>% 
+  dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+h.gene_set <- msigdbr::msigdbr(category = 'H') %>% 
+  dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+immune.gene_set <- msigdbr::msigdbr(category = 'C7') %>% 
+  filter(grepl('IMMUNESIGDB', gs_subcat)) %>%
+  dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+cp.h.dnmt3.exhaustion.gene_set <- cp.gene_set |> 
+  bind_rows(dnmt3, exhaustion, h.gene_set)
+
+
+## create gene ranks
+ds.rank <- ds.degs %>% 
+  rownames_to_column('genesymbol') %>% 
+  mutate(rank = -log10(pvalue)*sign(log2FoldChange)) %>% 
+  arrange(desc(rank)) %>% 
+  dplyr::select(genesymbol, rank) %>% 
+  deframe()
+
+ds.rank.shrink <- ds.degs.shrink %>% 
+  rownames_to_column('genesymbol') %>% 
+  mutate(rank = -log10(pvalue)*sign(log2FoldChange)) %>% 
+  arrange(desc(rank)) %>% 
+  dplyr::select(genesymbol, rank) %>% 
+  deframe()
+
+gsea.ds.inflamassome <- GSEA(ds.rank.shrink, TERM2GENE = inflamassome_rv127, eps = 0)
+gsea.ds.interferome <- GSEA(ds.rank.shrink, TERM2GENE = interferome, eps = 0)
+
+gsea.ds.immune <- GSEA(ds.rank.shrink, TERM2GENE = immune.gene_set, eps = 0)
+
+gsea.ds.cp <- GSEA(ds.rank.shrink, TERM2GENE = cp.gene_set, eps = 0)
+gsea.ds.h <- GSEA(ds.rank.shrink, TERM2GENE = h.gene_set, eps = 0)
+gsea.ds.go <- GSEA(ds.rank.shrink, TERM2GENE = go.gene_set, eps = 0)
+
+gsea.ds.cp.h.dnmt3.exhaustion <- GSEA(ds.rank.shrink, 
+                                      TERM2GENE = cp.h.dnmt3.exhaustion.gene_set, 
+                                      eps = 0)
+
+exhaustion.genes <- gsea.ds.cp.h.dnmt3.exhaustion@result %>% 
+  filter(ID %in% c('HALLMARK_MYC_TARGETS_V2', 
+                   'GSE9650_NAIVE_VS_EXHAUSTED_CD8_TCELL_DN')) %>% 
+  separate_longer_delim(core_enrichment, delim = '/') %>% 
+  select(ID, core_enrichment)
+
+
+cpm <- fpm(dds)
+
+library(ComplexHeatmap)
+library(grid)
+library(circlize)
+
+cpm.mat <- t(scale(t(log1p(cpm[exhaustion.genes$core_enrichment,]))))
+
+ds.col <- c('blue', 'yellow')
+names(ds.col) <- c('no', 'yes')
+column_ha = HeatmapAnnotation(Group = pheno[colnames(cpm.mat), 'ds'], 
+                              border = T, col = list(Group = ds.col), 
+                              annotation_legend_param = list(labels = c('HC', "DS")))
+
+Heatmap(cpm.mat, name = 'z-score\nCPM', 
+        col = colorRamp2(c(-4, -2, 0 , 2, 4), 
+                         c('darkblue', 'blue', 'white', 'red', 'darkred')),
+        show_column_names = F, top_annotation = column_ha, 
+        column_split = pheno[colnames(cpm.mat), 'ds'], row_split = 2, border = T, 
+        row_title = c('MYC Targets', 'GSE9650 Exhausted\nCD8 T cell Up'), 
+        column_title = NULL, row_names_gp = gpar(fontsize = 6), width = unit(7, 'cm'),
+        height = unit(10, 'cm'))
+
+p <- dotplot(gsea.ds.cp.h.dnmt3.exhaustion, color = 'NES', size = 'Count', 
+        showCategory = Inf, x = 'NES', label_format = 90, font.size = 7) +
+  scale_fill_viridis_c(option = 'H')
+
+ggsave('results/rnaseq/figures/enrichment_plot_cp+hallmark_dnmt3_exhaustion.pdf', p, scale = 1.2)
+
+inflamassome.gene_set <- inflamassome_rv127 %>% 
+  filter(!grepl('interleukin', term, ignore.case = T))
+
+inflamassome.genes <- gsea.ds.cp@result %>% 
+  select(core_enrichment) %>% 
+  separate_longer_delim(core_enrichment, delim = '/') %>% 
+  unique() %>% 
+  filter(core_enrichment %in% inflamassome.gene_set$gene) %>% 
+  deframe()
+
+interferome.genes <- gsea.ds.cp@result %>% 
+  select(core_enrichment) %>% 
+  separate_longer_delim(core_enrichment, delim = '/') %>% 
+  unique() %>% 
+  filter(core_enrichment %in% interferome$gene) %>% 
+  deframe()
+
+exhaustion.genes <- gsea.ds.immune@result %>% 
+  filter(grepl('exhausted', ID, ignore.case = T)) %>% 
+  select(core_enrichment) %>% 
+  separate_longer_delim(core_enrichment, delim = '/') %>% 
+  unique %>% 
+  deframe()
+
+barplot.gsea.cp <- gsea.ds.cp@result %>% 
+  arrange(NES) %>% 
+  mutate(ID = factor(ID, levels = ID)) %>% 
+  ggplot(aes(x = NES, y = ID, fill = NES)) +
+  geom_col() +
+  theme(axis.text.y = element_text(size = 5))+
+  scale_fill_viridis_c(option = 'H')
+
+top.20.barplot.gsea <- gsea.ds.cp@result %>% 
+  slice_min(pvalue, n = 20) %>% 
+  arrange(NES) %>% 
+  mutate(ID = factor(ID, levels = ID)) %>% 
+  ggplot(aes(x = NES, y = ID, fill = NES)) +
+  geom_col() +
+  theme(axis.text.y = element_text(size = 5))+
+  scale_fill_viridis_c(option = 'H')+
+  ylab('')
+
+#ggsave('results/rnaseq/figures/gsea_canonical_pathways_top20.pdf', 
+#       top.20.barplot.gsea, device = 'pdf', width = 7, height = 3.5)
+
+## Network
+library(RCy3)
+library(enrichplot)
+
+ds.up <- gsea.ds.cp %>% 
+  filter(NES > 0)
+
+edo.ds.up <- pairwise_termsim(ds.up)
+
+ds.up.plot <- emapplot(edo.ds.up, showCategory = Inf, ) 
+
+ds.up.plot.nodes <- ds.up.plot$data %>% 
+  select(name, size) %>% 
+  dplyr::rename(id = name) %>% 
+#  left_join(ds.up@compareClusterResul %>% select(Cluster, ID),
+#            by = c('id' = 'ID')) %>% 
+  mutate(score = 1) %>% 
+  mutate(score = as.integer(score)) %>% 
+ # pivot_wider(names_from = Cluster, values_from = score, values_fill = 0) %>% 
+  mutate(id = gsub("_", " ", id))
+
+ds.up.edges <- edo.ds.up@termsim %>% 
+  as.data.frame() %>% 
+  rownames_to_column('source') %>% 
+  pivot_longer(-source, names_to = 'target', values_to = 'weight', 
+               values_drop_na = T) %>% 
+  filter(source != target, weight >= 0.1) %>% 
+  mutate(source = gsub("_", " ", source), target = gsub("_", " ", target))
+
+createNetworkFromDataFrames(nodes = ds.up.plot.nodes,
+                            edges = ds.up.edges, 
+                            title = "DS - UP",
+                            collection = "Network collection")
+
+
+gsea.ds.h <- GSEA(ds.rank.shrink, TERM2GENE = h.gene_set, eps = 0)
+
+nes.range <- c(max(gsea.ds.h@result$NES), 
+               min(gsea.ds.h@result$NES), 
+               -max(gsea.ds.h@result$NES))
+
+nes.0to1 <- scales::rescale(nes.range, to=c(0, 1))
+
+barplot.gsea.h <- gsea.ds.h@result %>% 
+  arrange(NES) %>% 
+  mutate(ID = factor(ID, levels = ID)) %>% 
+  ggplot(aes(x = NES, y = ID, fill = NES)) +
+  geom_col() +
+  theme(axis.text.y = element_text(size = 5)) +
+  scale_fill_viridis_c(option = 'H', begin = nes.0to1[2]) +
+  labs(y = '')
+
+ggsave('results/rnaseq/figures/gsea_hallmark_pathways.pdf', barplot.gsea.h,
+       device = 'pdf', scale = 0.4)
+
+
+dotplot.gsea.h <- dotplot(gsea.ds.h, showCategory = Inf, color = 'NES', x = 'NES') + 
+  scale_fill_viridis_c(option = 'H', begin = nes.0to1[2]) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 70)) + 
+  theme(axis.text.y = element_text(size = 5))
+
+ggsave('results/rnaseq/figures/gsea_hallmark_pathways_dotplot.pdf', dotplot.gsea.h,
+       device = 'pdf', scale = 0.5)
+
+inflamatory.genes <- gsea.ds.h@result %>% 
+  filter(grepl('(INTERFERON|INFLAMMATORY|STAT|TNFA)', ID)) %>% 
+  dplyr::select(core_enrichment) %>% 
+  separate_longer_delim(core_enrichment, delim = '/') %>% 
+  arrange(core_enrichment) %>% 
+  unique() %>% 
+  deframe
+
+top.cp.genes <-  tail(sort(table(gsea.ds.cp@result %>% filter(NES > 0 ) %>% 
+                                   select(core_enrichment) %>% 
+                                   separate_longer_delim(core_enrichment, 
+                                                         delim = '/') %>%
+                                   deframe())),n = 20)
+
+gsea.ds.cp.top.genes <- gsea.ds.cp %>% 
+  filter(grepl(paste(names(top.cp.genes), collapse="|"), 
+               core_enrichment))
+
+p1 <- cnetplot(gsea.ds.cp.top.genes, showCategory = Inf, node_label = 'none')
+
+gene.overlap.count <- table(gsea.ds.cp.top.genes@result %>% 
+        select(core_enrichment) %>% 
+        separate_longer_delim(core_enrichment, delim = '/') %>% 
+        deframe()) %>% enframe
+
+cp.plot.nodes <- p1$data %>% 
+  select(name, size) %>% 
+  dplyr::rename(id = name) %>% 
+  mutate(score = 1) %>% 
+#  mutate(score = as.integer(score)) %>% 
+  mutate(id = gsub("_", " ", id)) %>% 
+  left_join(gene.overlap.count, by = c('id' = 'name')) %>% 
+  mutate(size = ifelse(!is.na(value), value, size)) %>% 
+  mutate(score = case_when(id %in% names(top.cp.genes) ~ 3,
+                           !is.na(value) ~ 2,
+                           TRUE ~ 1)) %>% 
+  select(-value)
+
+cp.plot.edges <- gsea.ds.cp.top.genes@result %>% 
+  select(ID, core_enrichment) %>% 
+  separate_longer_delim(core_enrichment, delim = '/') %>% 
+  mutate(weigth = 1) %>% 
+  rename(source = ID, target = core_enrichment) %>% 
+  mutate(source = gsub("_", " ", source), target = gsub("_", " ", target)) %>% 
+  mutate(color = ifelse(target %in% names(top.cp.genes), 1, 0))
+
+createNetworkFromDataFrames(nodes = cp.plot.nodes,
+                            edges = cp.plot.edges, 
+                            title = "DS - Canonical Pathways - V2",
+                            collection = "Network collection")
+
+
+pheno <- pheno %>% 
+  arrange(ds) %>% 
+  rename(Group = ds) %>% 
+  mutate(Group = ifelse(Group == 'no', 'HC', 'DS'))
+
+library(pheatmap)
+pheatmap(log1p(cpm.hgnc[inflamatory.genes, rownames(pheno)]), 
+         scale = 'row', cluster_cols = F, show_rownames = F,
+         show_colnames = F,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = pheno[, 2, drop=F])
+
+pheatmap(log1p(cpm.hgnc[interferome.genes, rownames(pheno)]), 
+         scale = 'row', cluster_cols = F, 
+         show_colnames = F, cellheight = 4, fontsize = 4,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = pheno[, 2, drop=F])
+
+pheatmap(log1p(cpm.hgnc[inflamassome.genes, rownames(pheno)]), 
+         scale = 'row', cluster_cols = F, 
+         show_colnames = F, cellheight = 10, fontsize = 10,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = pheno[, 2, drop=F])
+
+group.col <- c("#0D0887FF", "#F0F921FF")
+names(group.col) <- c('HC', 'DS')
+
+annot.col = list(Group = group.col)
+
+pheatmap(log1p(cpm.hgnc[names(top.cp.genes), rownames(pheno)]), 
+         scale = 'row', cluster_cols = F, 
+         show_colnames = F, cellheight = 5, fontsize = 5, cellwidth = 5,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 'red', 'darkred'))(100),
+         annotation_col = pheno[, 2, drop=F], annotation_colors = annot.col)
+
+#write_tsv(gsea.ds.h@result, 
+#          'results/rnaseq/enrichment_results_Hallmark_geneset.tsv')
+
+write_tsv(gsea.ds.cp@result, 
+          'results/rnaseq/enrichment_results_CanonicalPathways_geneset.tsv')
+
+## Hallmark gsva
+enriched.hallmark <- gsea.ds.h@result %>% 
+  select(ID, core_enrichment) %>% 
+  separate_longer_delim(core_enrichment, delim = '/')
+
+enriched.hallmark <- split(enriched.hallmark$core_enrichment, 
+                           enriched.hallmark$ID)
+
+ddsSE <- DESeqDataSet(se, design = ~ ds)
+
+ddsSE <- estimateSizeFactors(ddsSE)
+
+cpm <- fpm(ddsSE)
+
+mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene.annot <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                    filters = "ensembl_gene_id", 
+                    values = rownames(se), mart = mart)
+
+hgnc.annot <- gene.annot %>% 
+  filter(hgnc_symbol != '')
+
+cpm.hgnc <- cpm %>% 
+  as.data.frame() %>% 
+  rownames_to_column('ensembl_gene_id') %>% 
+  right_join(hgnc.annot) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  distinct(hgnc_symbol, .keep_all = T) %>% 
+  column_to_rownames('hgnc_symbol') %>% 
+  as.matrix()
+
+gsva.ds <- GSVA::gsva(log1p(cpm.hgnc), enriched.hallmark, min.sz = 5)
+
+pheatmap(gsva.ds, scale = 'row', annotation_col = pheno[,2,drop=F])
+
+pheno <- as.data.frame(colData(ds.mae))
+
+pheno.days <- pheno %>% 
+  mutate(visit_1_days = time_length(interval(visit_1_date, 
+                                             visit_1_date), unit = 'days'), 
+         visit_2_days = time_length(interval(visit_1_date, 
+                                             visit_2_date), unit = 'days'),
+         visit_1_from_boost_days = time_length(interval(visit_1_date,
+                                                      sarscov2_vacc_2nd_dose_date), unit = 'days'),
+         visit_2_from_boost_days = time_length(interval(visit_2_date,
+                                                      sarscov2_vacc_2nd_dose_date), unit = 'days'),
+         infect_first_days = time_length(interval(visit_1_date, 
+                                                  sarscov2_infection_1st_date), unit = 'days'))
+
+selected.samples <- pheno.days %>% 
+  as.data.frame() %>% 
+  rownames_to_column('patientid') %>% 
+  filter(!(patientid %in% c('SMP', 371, 181))) %>% 
+  filter(is.na(infect_first_days)) %>% 
+  filter(visit_1_from_boost_days > -100) %>% 
+  filter(ds == 'yes')
+
+abs <- ds.ma[['Antibodies']][, paste0(selected.samples$patientid, '_V2')]
+
+abs <- ds.ma[['Antibodies']]
+
+abs.tidy <- abs %>%
+  as.data.frame() %>% 
+  rownames_to_column('feature') %>% 
+  pivot_longer(-feature) %>% 
+  filter(grepl('_V2', name)) %>% 
+  mutate(name = sub('_V2', '', name)) %>% 
+  mutate(value = as.double(value))
+
+gsva.tidy <- gsva.ds %>% 
+  as.data.frame() %>% 
+  rownames_to_column('feature')  %>% 
+  pivot_longer(-feature) %>% 
+  mutate(name = sub('.*_', '', name))
+  
+hallmark.gsva <- bind_rows(abs.tidy, gsva.tidy) %>% 
+  pivot_wider(names_from = feature, values_from = value)
+
+hallmark.gsva.stat <- hallmark.gsva %>% 
+#  filter(name %in% selected.samples$patientid) %>% 
+  select(-name) %>% 
+  cor_test(vars = !starts_with('HALLMARK_'), vars2 = starts_with('HALLMARK_'),
+           method = 'spearman')
+```
+
+```{r Differential expression - Age by group and sex}
+library(cluster)
+
+#hclustFun <- function(x, k) {
+#  return(value = list(cluster = cutree(hclust(d = as.dist(1 - cor(t(x),
+#                                                                  method = "spearman"))),
+#                                       k)))}
+
+hclustFun <- function(x, k) {return(value = list(cluster = cutree(hclust(dist(x)), k = k)))}
+
+dge.obj <- SE2DGEList(se)
+
+### non-DS Female ----
+nonds.f.obj <- dge.obj[, dge.obj$samples$ds == 'no' & dge.obj$samples$sex == 'Female']
+
+keep <- filterByExpr(nonds.f.obj)
+nonds.f.obj <- nonds.f.obj[keep,,keep.lib.sizes=FALSE]
+
+nonds.f.obj <- normLibSizes(nonds.f.obj)
+
+X <- splines::ns(nonds.f.obj$samples$age_years, df = 5)
+#X <- poly(nonds.f.obj$samples$age_years, degree = 5)
+
+design <- model.matrix(~ X)
+
+nonds.f.obj <- estimateDisp(nonds.f.obj, design)
+
+#plotBCV(nonds.f.obj)
+#nonds.f.fit <- glmQLFit(nonds.f.obj, design, robust=TRUE)
+nonds.f.fit <- glmFit(nonds.f.obj, design, robust=TRUE)
+#plotQLDisp(nonds.f.fit)
+
+#nonds.f.fit <- glmQLFTest(nonds.f.fit, coef=2:6)
+nonds.f.fit <- glmLRT(nonds.f.fit, coef=2:6)
+nonds.f.tab <- as.data.frame(topTags(nonds.f.fit, n = Inf))
+
+nonds.f.degs <- dplyr::filter(nonds.f.tab, FDR < 0.1)
+
+## plot degs
+nonds.f.age.sorted.samples <- nonds.f.obj$samples |> arrange(age_years)
+
+nonds.f.cpm <- cpm(nonds.f.obj, log = T)
+degs.nonds.f.cpm <- nonds.f.cpm[rownames(nonds.f.degs), rownames(nonds.f.age.sorted.samples)]
+
+nonds.f.mat <- t(scale(t(degs.nonds.f.cpm)))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = nonds.f.age.sorted.samples$age_years)
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+ComplexHeatmap::Heatmap(nonds.f.mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F, 
+                        top_annotation = column_ha, 
+                        column_title = paste0("non-DS Female - ", 
+                                              nrow(nonds.f.degs), ' DEGs'),
+                        col = col_fun)
+
+#Hclust
+set.seed(seed = 2)
+
+fit <- clusGap(nonds.f.mat, hclustFun, K.max = 20, B = 100)
+nC <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+
+# plot gap
+plot(fit, main = "Optimal clusters number")
+abline(v = nC, col = "blue")
+
+# identify clusters
+clLS <- hclustFun(nonds.f.mat, nC) %>%
+  as.data.frame %>%
+  rownames_to_column('ensemblid') %>% 
+  arrange(cluster)
+
+genes.cluster <- nonds.f.mat |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(clLS) |> 
+  pivot_longer(-c(ensemblid, cluster)) |> 
+  left_join(nonds.f.age.sorted.samples |> 
+              rownames_to_column('name') |> 
+              select(name, age_years)) |> 
+  mutate(cluster = as.character(cluster))
+  
+p.nonds.f <- genes.cluster |> 
+  ggplot(aes(x = age_years, y = value, colour = cluster)) +
+  geom_smooth(aes(group = cluster), method = "loess", alpha = 0.3, linewidth = 1.5) +
+  labs(title = 'Age-associated gene expression - non-DS Female')
+
+ggsave('results/rnaseq/figures/cluster_trajectory_nonDS_female.pdf', 
+       p.nonds.f, scale = 0.5)
+### non-DS Male ----
+nonds.m.obj <- dge.obj[, dge.obj$samples$ds == 'no' & dge.obj$samples$sex == 'Male']
+
+keep <- filterByExpr(nonds.m.obj)
+nonds.m.obj <- nonds.m.obj[keep,,keep.lib.sizes=FALSE]
+
+nonds.m.obj <- normLibSizes(nonds.m.obj)
+
+X <- splines::ns(nonds.m.obj$samples$age_years, df = 5)
+#X <- poly(nonds.m.obj$samples$age_years, degree = 5)
+
+design <- model.matrix(~ X)
+
+nonds.m.obj <- estimateDisp(nonds.m.obj, design)
+
+#plotBCV(nonds.m.obj)
+
+nonds.m.fit <- glmFit(nonds.m.obj, design, robust=TRUE)
+#plotQLDisp(nonds.m.fit)
+
+nonds.m.fit <- glmLRT(nonds.m.fit, coef=2:6)
+nonds.m.tab <- as.data.frame(topTags(nonds.m.fit, n = Inf))
+
+nonds.m.degs <- dplyr::filter(nonds.m.tab, FDR < 0.1)
+
+# plot degs
+nonds.m.age.sorted.samples <- nonds.m.obj$samples |> arrange(age_years)
+
+nonds.m.cpm <- cpm(nonds.m.obj, log = T)
+degs.nonds.m.cpm <- nonds.m.cpm[rownames(nonds.m.degs), rownames(nonds.m.age.sorted.samples)]
+
+nonds.m.mat <- t(scale(t(degs.nonds.m.cpm)))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = nonds.m.age.sorted.samples$age_years)
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+ComplexHeatmap::Heatmap(nonds.m.mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F, 
+                        top_annotation = column_ha, 
+                        column_title = paste0("non-DS Male - ", 
+                                              nrow(nonds.m.degs), ' DEGs'),
+                        col = col_fun)
+
+#Hclust
+set.seed(seed = 2)
+fit <- clusGap(nonds.m.mat, hclustFun, K.max = 10, B = 100)
+nC <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+
+# plot gap
+plot(fit, main = "Optimal clusters number")
+abline(v = nC, col = "blue")
+
+# identify clusters
+clLS <- hclustFun(nonds.m.mat, nC) %>%
+  as.data.frame %>%
+  rownames_to_column('ensemblid') %>% 
+  arrange(cluster)
+
+genes.cluster <- nonds.m.mat |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(clLS) |> 
+  pivot_longer(-c(ensemblid, cluster)) |> 
+  left_join(nonds.m.age.sorted.samples |> 
+              rownames_to_column('name') |> 
+              select(name, age_years)) |> 
+  mutate(cluster = as.character(cluster))
+  
+p.nonds.m <- genes.cluster |> 
+  ggplot(aes(x = age_years, y = value, colour = cluster)) +
+  geom_smooth(aes(group = cluster), method = "loess", alpha = 0.3, linewidth = 1.5) +
+  labs(title = 'Age-associated gene expression - non-DS Male')
+
+ggsave('results/rnaseq/figures/cluster_trajectory_nonDS_Male.pdf', 
+       p.nonds.m, scale = 0.5)
+
+### DS Female ----
+ds.f.obj <- dge.obj[, dge.obj$samples$ds == 'yes' & dge.obj$samples$sex == 'Female']
+
+keep <- filterByExpr(ds.f.obj)
+ds.f.obj <- ds.f.obj[keep,,keep.lib.sizes=FALSE]
+
+ds.f.obj <- normLibSizes(ds.f.obj)
+
+X <- splines::ns(ds.f.obj$samples$age_years, df = 5)
+#X <- poly(ds.f.obj$samples$age_years, degree = 5)
+
+bind_cols(X, ds.f.obj$samples$age_years) |> 
+  dplyr::rename(age_years = `...6`) |> 
+  pivot_longer(-age_years) |> 
+  ggplot(aes(x = age_years, y = value, color = name)) +
+  geom_line()
+
+design <- model.matrix(~ X)
+
+ds.f.obj <- estimateDisp(ds.f.obj, design)
+
+#plotBCV(ds.f.obj)
+
+ds.f.fit <- glmFit(ds.f.obj, design, robust=TRUE)
+#plotQLDisp(ds.fit)
+
+ds.f.fit <- glmLRT(ds.f.fit, coef=2:6)
+ds.f.tab <- as.data.frame(topTags(ds.f.fit, n = Inf))
+
+ds.f.degs <- dplyr::filter(ds.f.tab, FDR < 0.1)
+
+# plot degs
+ds.f.age.sorted.samples <- ds.f.obj$samples |> arrange(age_years)
+
+ds.f.cpm <- cpm(ds.f.obj, log = T)
+degs.ds.f.cpm <- ds.f.cpm[rownames(ds.f.degs), rownames(ds.f.age.sorted.samples)]
+
+ds.f.mat <- t(scale(t(degs.ds.f.cpm)))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = ds.f.age.sorted.samples$age_years)
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+ComplexHeatmap::Heatmap(ds.f.mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F, 
+                        top_annotation = column_ha, 
+                        column_title = paste0("DS Female - ", 
+                                              nrow(ds.f.degs), ' DEGs'),
+                        col = col_fun)
+
+#Hclust
+set.seed(seed = 2)
+fit <- clusGap(ds.f.mat, hclustFun, K.max = 10, B = 100)
+nC <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+
+# plot gap
+plot(fit, main = "Optimal clusters number")
+abline(v = nC, col = "blue")
+
+# identify clusters
+clLS <- hclustFun(ds.f.mat, nC) %>%
+  as.data.frame %>%
+  rownames_to_column('ensemblid') %>% 
+  arrange(cluster)
+
+genes.cluster <- ds.f.mat |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(clLS) |> 
+  pivot_longer(-c(ensemblid, cluster)) |> 
+  left_join(ds.f.age.sorted.samples |> 
+              rownames_to_column('name') |> 
+              select(name, age_years)) |> 
+  mutate(cluster = as.character(cluster))
+  
+p.ds.f <- genes.cluster |> 
+  ggplot(aes(x = age_years, y = value, colour = cluster)) +
+  geom_smooth(aes(group = cluster), method = "loess", alpha = 0.3, linewidth = 1.5) +
+  labs(title = 'Age-associated gene expression - DS Female')
+
+ggsave('results/rnaseq/figures/cluster_trajectory_DS_Female.pdf', 
+       p.ds.f, scale = 0.5)
+
+### DS Male ----
+ds.m.obj <- dge.obj[, dge.obj$samples$ds == 'yes' & dge.obj$samples$sex == 'Male']
+
+keep <- filterByExpr(ds.m.obj)
+ds.m.obj <- ds.m.obj[keep,,keep.lib.sizes=FALSE]
+
+ds.m.obj <- normLibSizes(ds.m.obj)
+
+X <- splines::ns(ds.m.obj$samples$age_years, df = 5)
+#X <- poly(ds.m.obj$samples$age_years, degree = 5)
+
+design <- model.matrix(~ X)
+
+ds.m.obj <- estimateDisp(ds.m.obj, design)
+
+#plotBCV(ds.m.obj)
+
+ds.m.fit <- glmFit(ds.m.obj, design, robust=TRUE)
+#plotQLDisp(ds.fit)
+
+ds.m.fit <- glmLRT(ds.m.fit, coef=2:6)
+ds.m.tab <- as.data.frame(topTags(ds.m.fit, n = Inf))
+
+ds.m.degs <- dplyr::filter(ds.m.tab, FDR < 0.1)
+
+# plot degs
+ds.m.age.sorted.samples <- ds.m.obj$samples |> arrange(age_years)
+
+ds.m.cpm <- cpm(ds.m.obj, log = T)
+degs.ds.m.cpm <- ds.m.cpm[rownames(ds.m.degs), rownames(ds.m.age.sorted.samples)]
+
+ds.m.mat <- t(scale(t(degs.ds.m.cpm)))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = ds.m.age.sorted.samples$age_years)
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+ComplexHeatmap::Heatmap(ds.m.mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F, 
+                        top_annotation = column_ha, 
+                        column_title = paste0("DS Male - ", 
+                                              nrow(ds.m.degs), ' DEGs'),
+                        col = col_fun)
+
+#Hclust
+set.seed(seed = 2)
+fit <- clusGap(ds.m.mat, hclustFun, K.max = 10, B = 100)
+nC <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+
+# plot gap
+plot(fit, main = "Optimal clusters number")
+abline(v = nC, col = "blue")
+
+# identify clusters
+clLS <- hclustFun(ds.m.mat, nC) %>%
+  as.data.frame %>%
+  rownames_to_column('ensemblid') %>% 
+  arrange(cluster)
+
+genes.cluster <- ds.m.mat |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(clLS) |> 
+  pivot_longer(-c(ensemblid, cluster)) |> 
+  left_join(ds.m.age.sorted.samples |> 
+              rownames_to_column('name') |> 
+              select(name, age_years)) |> 
+  mutate(cluster = as.character(cluster))
+  
+p.ds.m <- genes.cluster |> 
+  ggplot(aes(x = age_years, y = value, colour = cluster)) +
+  geom_smooth(aes(group = cluster), method = "loess", alpha = 0.3, linewidth = 1.5) +
+  labs(title = 'Age-associated gene expression - DS Male')
+
+ggsave('results/rnaseq/figures/cluster_trajectory_DS_Male.pdf', 
+       p.ds.m, scale = 0.5)
+
+
+
+
+### Combine DEGs ----
+
+dge.obj <- normLibSizes(dge.obj)
+
+# plot degs
+degs.list <- unique(c(rownames(ds.f.degs),
+                      rownames(ds.m.degs), 
+                      rownames(nonds.m.degs), 
+                      rownames(nonds.f.degs)))
+
+age.sorted.samples <- dge.obj$samples |> arrange(age_years)
+
+cpm.df <- cpm(dge.obj, log = T)
+degs.cpm <- cpm.df[degs.list, rownames(age.sorted.samples)]
+
+ds.m.mat <- t(scale(t(degs.cpm)))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = age.sorted.samples$age_years)
+
+ds.sex_group <- interaction(age.sorted.samples$ds, age.sorted.samples$sex)
+
+il1b.pos <- which(rownames(ds.m.mat) == 'ENSG00000125538')
+il6.pos <- which(rownames(ds.m.mat) == 'ENSG00000136244')
+
+ha =  rowAnnotation(foo = anno_mark(at = c(il1b.pos, il6.pos), 
+                                    labels = c('IL1B', 'IL6')))
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+
+#pdf('results/rnaseq/figures/heatmap_degs_age_DS_nonDS_male_female.pdf', 
+#    width = 14, height = 8.5)
+ComplexHeatmap::Heatmap(ds.m.mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F,
+                        top_annotation = column_ha, right_annotation = ha,
+                        col = col_fun, column_split = ds.sex_group,
+                        row_split = clLS$cluster)
+#dev.off()
+
+#Hclust
+set.seed(seed = 2)
+fit <- clusGap(ds.m.mat, hclustFun, K.max = 10, B = 100)
+nC <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+
+# plot gap
+plot(fit, main = "Optimal clusters number")
+abline(v = nC, col = "blue")
+
+# identify clusters
+clLS <- hclustFun(ds.m.mat, nC) %>%
+  as.data.frame %>%
+  rownames_to_column('ensemblid') 
+
+#### non-DS ----
+nonds.obj <- dge.obj[, dge.obj$samples$ds == 'no']
+
+keep <- filterByExpr(nonds.obj)
+nonds.obj <- nonds.obj[keep,,keep.lib.sizes=FALSE]
+
+nonds.obj <- normLibSizes(nonds.obj)
+
+#X <- scale(nonds.obj$samples$age_years)
+#X <- splines::ns(nonds.obj$samples$age_years, df = 5)
+X <- poly(nonds.obj$samples$age_years, degree = 5)
+
+bind_cols(X, nonds.obj$samples$age_years) |> 
+  dplyr::rename(age_years = `...6`) |> 
+  pivot_longer(-age_years) |> 
+  ggplot(aes(x = age_years, y = value, color = name)) +
+  geom_line()
+
+design <- model.matrix(~ X + nonds.obj$samples$sex)
+
+nonds.obj <- estimateDisp(nonds.obj, design)
+
+plotBCV(nonds.obj)
+
+nonds.fit <- glmFit(nonds.obj, design)
+#plotQLDisp(nonds.fit)
+
+nonds.fit <- glmLRT(nonds.fit, coef=2:6)
+nonds.tab <- as.data.frame(topTags(nonds.fit, n = Inf))
+
+nonds.degs <- dplyr::filter(nonds.tab, FDR < 0.05)
+
+## plot degs
+nonds.age.sorted.samples <- nonds.obj$samples |> arrange(age_years)
+
+nonds.cpm <- cpm(nonds.obj, log = T)
+degs.nonds.cpm <- nonds.cpm[rownames(nonds.degs), rownames(nonds.age.sorted.samples)]
+
+nonds.mat <- t(scale(t(degs.nonds.cpm)))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = nonds.age.sorted.samples$age_years)
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+ComplexHeatmap::Heatmap(nonds.mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F, 
+                        top_annotation = column_ha, column_title = "non-DS individuals",
+                        col = col_fun, row_split = 4)
+### DS ----
+ds.obj <- dge.obj[, dge.obj$samples$ds == 'yes']
+
+keep <- filterByExpr(ds.obj)
+ds.obj <- ds.obj[keep,,keep.lib.sizes=FALSE]
+
+ds.obj <- normLibSizes(ds.obj)
+
+#X <- splines::ns(ds.obj$samples$age_years, df = 5)
+X <- poly(ds.obj$samples$age_years, degree = 5)
+
+design <- model.matrix(~ X)
+
+ds.obj <- estimateDisp(ds.obj, design)
+
+plotBCV(ds.obj)
+
+ds.fit <- glmFit(ds.obj, design, robust=TRUE)
+#plotQLDisp(ds.fit)
+
+ds.fit <- glmLRT(ds.fit, coef = 2:6)
+ds.tab <- as.data.frame(topTags(ds.fit, n = Inf))
+
+ds.degs <- dplyr::filter(ds.tab, FDR < 0.1)
+
+## plot degs
+ds.age.sorted.samples <- ds.obj$samples |> arrange(age_years)
+
+ds.cpm <- cpm(ds.obj, log = T)
+degs.ds.cpm <- ds.cpm[rownames(ds.degs), rownames(ds.age.sorted.samples)]
+
+ds.mat <- t(scale(t(degs.ds.cpm)))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = ds.age.sorted.samples$age_years)
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+ComplexHeatmap::Heatmap(ds.mat, name = 'CPM\nz-score', cluster_columns = F, show_row_names = F, 
+                        show_column_names = F, top_annotation = column_ha, 
+                        column_title = "DS individuals", col = col_fun)
+```
+
+```{r Moanin}
+library(moanin)
+
+dge.obj <- SE2DGEList(se)
+
+keep <- filterByExpr(dge.obj)
+dge.obj <- dge.obj[keep,,keep.lib.sizes=FALSE]
+dge.obj <- normLibSizes(dge.obj)
+
+dge.cpm <- cpm(dge.obj)
+
+meta <- dge.obj$samples[,c(5, 6, 9)] |> 
+  mutate(Group = interaction(ds, sex)) |> 
+  rename(Timepoint = age_years) |> 
+  dplyr::select(-c(ds, sex)) |> 
+  relocate(Group)
+
+moanin_model = create_moanin_model(data = as.data.frame(dge.cpm), 
+                                   meta = meta,
+                                   degrees_of_freedom = 5,
+                                   log_transform=TRUE)
+
+timecourseContrasts <- c("yes.Female-no.Female",
+                         "yes.Male-no.Male",
+                         "yes.Female-yes.Male",
+                         "no.Female-no.Male")
+
+splinePre <- DE_timecourse(moanin_model, contrasts = timecourseContrasts)
+
+male.degs <- splinePre |> filter(`yes.Male-no.Male_qval` < 0.05)
+female.degs <- splinePre |> filter(`yes.Female-no.Female_qval` < 0.05)
+
+ds.female.degs <- splinePre |> filter(`yes.Female-yes.Male_qval` < 0.05)
+nonds.female.degs <- splinePre |> filter(`no.Female-no.Male_qval` < 0.05)
+
+male.degs <- splinePre |> filter(`yes.Male-no.Male_qval` < 0.05) |> 
+  arrange(`yes.Male-no.Male_pval`)
+
+####  MALE ANALYSIS ----
+#plot degs
+degs.list <- rownames(male.degs)
+
+dge.m.obj <- dge.obj[, dge.obj$samples$sex == 'Male']
+
+m.age.sorted.samples <- dge.m.obj$samples |> arrange(age_years)
+
+cpm.m.df <- cpm(dge.m.obj, log = T)
+degs.m.cpm <- cpm.m.df[degs.list, rownames(m.age.sorted.samples)]
+
+m.mat <- t(scale(t(degs.m.cpm)))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = m.age.sorted.samples$age_years)
+
+il1b.pos <- which(rownames(m.mat) == 'ENSG00000125538')
+il6.pos <- which(rownames(m.mat) == 'ENSG00000136244')
+
+ha =  rowAnnotation(foo = anno_mark(at = c(il1b.pos, il6.pos), 
+                                    labels = c('IL1B', 'IL6')))
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+
+#Hclust
+set.seed(seed = 2)
+#fit <- clusGap(m.mat, hclustFun, K.max = 10, B = 100)
+#nC <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+fit.kmeans <- clusGap(m.mat, kmeans, K.max = 10, iter.max = 20)
+nC.kmeans <- maxSE(fit.kmeans$Tab[, "gap"], 
+                   fit.kmeans$Tab[, "SE.sim"], 
+                   method = "Tibs2001SEmax")
+
+# plot gap
+plot(fit.kmeans, main = "Optimal clusters number")
+abline(v = nC.kmeans, col = "blue")
+
+# identify clusters
+#clLS <- hclustFun(m.mat, nC) %>%
+#  as.data.frame %>%
+#  rownames_to_column('ensemblid') 
+
+clLS.kmeans <- kmeans(m.mat, nC.kmeans)
+
+#pdf('results/rnaseq/figures/heatmap_degs_age_Male_moanin_kmeans.pdf', 
+#    width = 7, height = 4.25)
+
+ComplexHeatmap::Heatmap(m.mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F,
+                        top_annotation = column_ha, 
+                        #right_annotation = ha,
+                        use_raster = F,
+                        column_title = c('non-DS', 'DS'),
+                        col = col_fun, column_split = m.age.sorted.samples$ds,
+                        row_split = clLS.kmeans$cluster)
+#dev.off()
+
+genes.cluster <- m.mat |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(enframe(clLS.kmeans$cluster, 
+                    name =  'ensemblid', value = 'cluster')) |>  
+  pivot_longer(-c(ensemblid, cluster)) |> 
+  left_join(m.age.sorted.samples |> 
+              rownames_to_column('name') |> 
+              dplyr::select(name, age_years, ds)) |> 
+  mutate(cluster = as.character(cluster))
+  
+p.m <- genes.cluster |> 
+  ggplot(aes(x = age_years, y = value, colour = ds)) +
+  geom_smooth(aes(group = ds), method = "loess", alpha = 0.3, linewidth = 1.5) +
+  facet_wrap(~cluster) +
+  scale_colour_manual(values = c("#0D0887FF", "#F0F921FF"), 
+                      labels = c('non-DS', 'DS'),
+                      name = "Group") +
+  labs(title = 'Age-associated gene expression - Male', y = 'CPM z-score',
+       x = 'Age (years)')
+
+#ggsave('results/rnaseq/figures/moanin_cluster_trajectory_Male_kmeans.pdf', 
+#       p.m, scale = 0.5)
+
+## Over representation analysis
+clLS.hgnc <- enframe(clLS.kmeans$cluster, 
+                    name =  'ensemblid', value = 'cluster') |>  
+  left_join(dge.obj$genes |> rownames_to_column('ensemblid')) |> 
+  dplyr::select(hgnc_symbol, cluster)
+
+#write_tsv(clLS.hgnc, 'results/rnaseq/gapstatistic_male_genes_kmeans_clusters.tsv')
+#clLS.hgnc <- read_tsv('results/rnaseq/gapstatistic_male_genes_kmeans_clusters.tsv')
+  
+genes.cluster.list <- split(clLS.hgnc$hgnc_symbol, clLS.hgnc$cluster)
+
+gene_set_senmayo <- readxl::read_excel('data/scenescence_gmt.xlsx')
+
+gene_set_h <- msigdbr::msigdbr(category = 'H') |> 
+  dplyr::select(gs_name, gene_symbol) %>% 
+  unique()
+
+gene_set_senescence <- msigdbr::msigdbr() |> 
+  dplyr::select(gs_name, gene_symbol) %>% 
+  filter(grepl('(senesc|anergy|exha)', gs_name, ignore.case = T)) |> 
+  bind_rows(gene_set_senmayo)
+
+gene_set_c <- msigdbr::msigdbr(category = 'C2') |> 
+  filter(grepl('CP:', gs_subcat)) |> 
+  dplyr::select(gs_name, gene_symbol) |>  
+  bind_rows(gene_set_senescence) |> 
+  unique()
+
+gene_set_hpo <- msigdbr::msigdbr(category = 'C5') |> 
+  filter(gs_subcat == 'HPO') |> 
+  dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+ora.male <- compareCluster(genes.cluster.list, fun = 'enricher', 
+                           TERM2GENE = gene_set_h,
+                           universe =  dge.obj$genes$hgnc_symbol)
+
+#write_tsv(ora.male@compareClusterResult, 'results/rnaseq/ora_male_clusters_kmeans.tsv')
+#male_pathways <- read_tsv('results/rnaseq/ora_male_clusters.tsv')
+
+ora.male.hpo <- compareCluster(genes.cluster.list, fun = 'enricher', 
+                             TERM2GENE = gene_set_hpo,
+                             universe =  dge.obj$genes$hgnc_symbol)
+#write_tsv(ora.male.hpo@compareClusterResult,
+#          'results/rnaseq/ora_male_clusters_kmeans_human_phenotype.tsv')
+
+ora.plot <- dotplot(ora.male,  showCategory = 15, size = "Count", label_format = 50, 
+                    font.size = 10) + ggtitle('Top 15 pathways - Male')
+
+#ggsave('results/rnaseq/figures/dotplot_ora_male_clusters.pdf', ora.plot, 
+#       height = 5, width = 6)
+
+####  FEMALE ANALYSIS ----
+#plot degs
+f.degs.list <- rownames(female.degs)
+
+dge.f.obj <- dge.obj[, dge.obj$samples$sex == 'Female']
+
+f.age.sorted.samples <- dge.f.obj$samples |> arrange(age_years)
+
+cpm.f.df <- cpm(dge.f.obj, log = T)
+degs.f.cpm <- cpm.f.df[f.degs.list, rownames(f.age.sorted.samples)]
+
+f.mat <- t(scale(t(degs.f.cpm)))
+
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = f.age.sorted.samples$age_years)
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
+
+#Hclust
+set.seed(seed = 2)
+#fit <- clusGap(f.mat, hclustFun, K.max = 10, B = 100)
+#nC <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+fit.kmeans <- clusGap(f.mat, kmeans, K.max = 10, iter.max = 20)
+nC.kmeans <- maxSE(fit.kmeans$Tab[, "gap"], 
+                   fit.kmeans$Tab[, "SE.sim"], 
+                   method = "Tibs2001SEmax")
+
+# plot gap
+#plot(fit, main = "Optimal clusters number")
+#abline(v = nC, col = "blue")
+plot(fit.kmeans, main = "Optimal clusters number")
+abline(v = nC.kmeans, col = "blue")
+
+# identify clusters
+#clLS <- hclustFun(f.mat, nC) %>%
+#  as.data.frame %>%
+#  rownames_to_column('ensemblid') 
+
+clLS.kmeans <- kmeans(f.mat, nC.kmeans) 
+
+pdf('results/rnaseq/figures/heatmap_degs_age_Female_moanin_kmeans.pdf', 
+    width = 7, height = 4.25)
+ComplexHeatmap::Heatmap(f.mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F,
+                        top_annotation = column_ha, 
+                        #right_annotation = ha,
+                        use_raster = F,
+                        column_title = c('non-DS', 'DS'),
+                        col = col_fun, column_split = f.age.sorted.samples$ds,
+                        row_split = clLS.kmeans$cluster)
+dev.off()
+
+genes.cluster <- f.mat |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(enframe(clLS.kmeans$cluster, 
+                    name =  'ensemblid', value = 'cluster')) |> 
+  pivot_longer(-c(ensemblid, cluster)) |> 
+  left_join(f.age.sorted.samples |> 
+              rownames_to_column('name') |> 
+              dplyr::select(name, age_years, ds)) |> 
+  mutate(cluster = as.character(cluster))
+  
+p.f <- genes.cluster |> 
+  ggplot(aes(x = age_years, y = value, colour = ds)) +
+  geom_smooth(aes(group = ds), method = "loess", alpha = 0.3, linewidth = 1.5, se = F) +
+  facet_wrap(~cluster) +
+  scale_colour_manual(values = c("#0D0887FF", "#F0F921FF"), 
+                      labels = c('non-DS', 'DS'),
+                      name = "Group") +
+  labs(title = 'Age-associated gene expression - Female', y = 'CPM z-score',
+       x = 'Age (years)')
+
+#ggsave('results/rnaseq/figures/moanin_cluster_trajectory_Female_kmeans.pdf', 
+#       p.f, scale = 0.5)
+
+## Over representation analysis
+clLS.hgnc <- enframe(clLS.kmeans$cluster, 
+                    name =  'ensemblid', value = 'cluster') |> 
+  left_join(dge.obj$genes |> rownames_to_column('ensemblid')) |> 
+  dplyr::select(hgnc_symbol, cluster)
+
+#write_tsv(clLS.hgnc, 'results/rnaseq/gapstatistic_female_genes_kmeans_clusters.tsv')
+#clLS.hgnc <- read_tsv('results/rnaseq/gapstatistic_female_genes_kmeans_clusters.tsv')
+
+genes.cluster.list <- split(clLS.hgnc$hgnc_symbol, clLS.hgnc$cluster)
+
+#gene_set_h <- msigdbr::msigdbr(category = 'H') |> 
+#  dplyr::select(gs_name, gene_symbol) %>% 
+#  unique()
+#
+#gene_set_c <- msigdbr::msigdbr(category = 'C2') |> 
+#  filter(grepl('CP:', gs_subcat)) |> 
+#  dplyr::select(gs_name, gene_symbol) %>% 
+#  unique()
+
+ora.female <- compareCluster(genes.cluster.list, fun = 'enricher', 
+                             TERM2GENE = gene_set_h,
+                             universe =  dge.obj$genes$hgnc_symbol)
+
+#write_tsv(ora.female@compareClusterResult,
+#          'results/rnaseq/ora_female_clusters_kmeans.tsv')
+#female_pathways <- read_tsv('results/rnaseq/ora_female_clusters.tsv')
+
+
+ora.female.hpo <- compareCluster(genes.cluster.list, fun = 'enricher', 
+                             TERM2GENE = gene_set_hpo,
+                             universe =  dge.obj$genes$hgnc_symbol)
+#write_tsv(ora.female.hpo@compareClusterResult,
+#          'results/rnaseq/ora_female_clusters_kmeans_human_phenotype.tsv')
+
+
+ora.female.plot <- dotplot(ora.female,  showCategory = 15, size = "Count", 
+                           label_format = 70, font.size = 8) + 
+  ggtitle('Top 15 pathways - Female')
+
+ggsave('results/rnaseq/figures/dotplot_ora_female_clusters_kmeans.pdf', 
+       ora.female.plot, height = 7.5, width = 8)
+
+```
+
+```{r Moanin - all samples}
+library(moanin)
+
+dge.obj <- SE2DGEList(se)
+
+keep <- filterByExpr(dge.obj)
+dge.obj <- dge.obj[keep,,keep.lib.sizes=FALSE]
+dge.obj <- normLibSizes(dge.obj)
+
+dge.cpm <- cpm(dge.obj)
+
+meta <- dge.obj$samples[,c(5, 6,9)] |> 
+  rename(Timepoint = age_years,
+         Group = ds) |> 
+  mutate(Group = factor(Group, levels = c('yes', 'no')))
+
+moanin_model = create_moanin_model(data = as.data.frame(dge.cpm), 
+                                   meta = meta,
+                                   degrees_of_freedom = 5,
+                                   log_transform=TRUE)
+
+timecourseContrasts <- c("yes-no")
+
+splinePre <- DE_timecourse(moanin_model, contrasts = timecourseContrasts)
+
+degs.ds <- splinePre |> filter(`yes-no_qval` < 0.05) |> 
+  arrange(`yes-no_pval`)
+
+#plot degs
+degs.list <- rownames(degs.ds)
+
+cpm.df <- cpm(dge.obj, log = T)
+degs.cpm <- cpm.df[degs.list, ]
+
+mat <- t(scale(t(degs.cpm)))
+
+#Hclust
+set.seed(seed = 42)
+fit.kmeans <- clusGap(mat, kmeans, K.max = 20, iter.max = 20)
+nC.kmeans <- maxSE(fit.kmeans$Tab[, "gap"], 
+                  fit.kmeans$Tab[, "SE.sim"], 
+                   method = "Tibs2001SEmax")
+
+# plot gap
+plot(fit.kmeans, main = "Optimal clusters number")
+abline(v = nC.kmeans, col = "blue")
+
+# identify clusters
+#clLS <- hclustFun(m.mat, nC) %>%
+#  as.data.frame %>%
+#  rownames_to_column('ensemblid') 
+
+clLS.kmeans <- kmeans(mat, nC.kmeans)
+
+#pdf('results/rnaseq/figures/heatmap_degs_age_Male_moanin_kmeans.pdf', 
+#    width = 7, height = 4.25)
+
+age.sorted.samples <- dge.obj$samples |> arrange(age_years)
+
+col_fun = colorRamp2(c(-4, -2, 0, 2, 4), 
+                     c("darkblue","blue", "white", "red", "darkred"))
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = age.sorted.samples$age_years)
+
+ComplexHeatmap::Heatmap(mat, name = 'CPM\nz-score', cluster_columns = F, 
+                        show_row_names = F, show_column_names = F,
+                        top_annotation = column_ha, 
+                        use_raster = F,
+                        column_title = c('non-DS', 'DS'),
+                        column_split = age.sorted.samples$ds,
+                        row_split = clLS.kmeans$cluster)
+#dev.off()
+
+age_groups.ds <- cut(age.sorted.samples[age.sorted.samples$ds == 'yes', 6 ], 
+                     breaks = c(0, 25, 40, 100), 
+                     labels = c("0-25", "26-40", "41-100"))
+
+age_groups.nonds <- cut(age.sorted.samples[age.sorted.samples$ds == 'no', 6 ], 
+                        breaks = c(0, 25, 40, 100), 
+                        labels = c("0-25", "26-40", "41-100"))
+
+genes.cluster <- m.mat |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(enframe(clLS.kmeans$cluster, 
+                    name =  'ensemblid', value = 'cluster')) |>  
+  pivot_longer(-c(ensemblid, cluster)) |> 
+  left_join(m.age.sorted.samples |> 
+              rownames_to_column('name') |> 
+              dplyr::select(name, age_years, ds)) |> 
+  mutate(cluster = as.character(cluster))
+  
+p.m <- genes.cluster |> 
+  ggplot(aes(x = age_years, y = value, colour = ds)) +
+  geom_smooth(aes(group = ds), method = "loess", alpha = 0.3, linewidth = 1.5) +
+  facet_wrap(~cluster) +
+  scale_colour_manual(values = c("#0D0887FF", "#F0F921FF"), 
+                      labels = c('non-DS', 'DS'),
+                      name = "Group") +
+  labs(title = 'Age-associated gene expression - Male', y = 'CPM z-score',
+       x = 'Age (years)')
+
+#ggsave('results/rnaseq/figures/moanin_cluster_trajectory_Male_kmeans.pdf', 
+#       p.m, scale = 0.5)
+
+## Over representation analysis
+clLS.hgnc <- enframe(clLS.kmeans$cluster, 
+                    name =  'ensemblid', value = 'cluster') |>  
+  left_join(dge.obj$genes |> rownames_to_column('ensemblid')) |> 
+  dplyr::select(hgnc_symbol, cluster)
+
+#write_tsv(clLS.hgnc, 'results/rnaseq/gapstatistic_male_genes_kmeans_clusters.tsv')
+  
+genes.cluster.list <- split(clLS.hgnc$hgnc_symbol, clLS.hgnc$cluster)
+
+gene_set_senmayo <- readxl::read_excel('data/scenescence_gmt.xlsx')
+
+gene_set_h <- msigdbr::msigdbr(category = 'H') |> 
+  dplyr::select(gs_name, gene_symbol) %>% 
+  unique()
+
+gene_set_senescence <- msigdbr::msigdbr() |> 
+  dplyr::select(gs_name, gene_symbol) %>% 
+  filter(grepl('(senesc|anergy|exha)', gs_name, ignore.case = T)) |> 
+  bind_rows(gene_set_senmayo)
+
+gene_set_c <- msigdbr::msigdbr(category = 'C2') |> 
+  filter(grepl('CP:', gs_subcat)) |> 
+  dplyr::select(gs_name, gene_symbol) |>  
+  bind_rows(gene_set_senescence) |> 
+  unique()
+
+gene_set_msigdb <- msigdbr::msigdbr()
+
+ora.male <- compareCluster(genes.cluster.list, fun = 'enricher', 
+                           TERM2GENE = gene_set_c,
+                           universe =  dge.obj$genes$hgnc_symbol)
+
+#write_tsv(ora.male@compareClusterResult, 'results/rnaseq/ora_male_clusters_kmeans.tsv')
+#male_pathways <- read_tsv('results/rnaseq/ora_male_clusters.tsv')
+
+ora.plot <- dotplot(ora.male,  showCategory = 15, size = "Count", label_format = 50, 
+                    font.size = 10) + ggtitle('Top 15 pathways - Male')
+
+#ggsave('results/rnaseq/figures/dotplot_ora_male_clusters.pdf', ora.plot, 
+#       height = 5, width = 6)
+```
+
+```{r gsva}
+library(GSVA)
+library(biomaRt)
+library(ImmuneSignatures2)
+library(pheatmap)
+data("all_genesets", package = "ImmuneSignatures2")
+
+ddsSE <- DESeqDataSet(se, design = ~ ds)
+
+ddsSE <- estimateSizeFactors(ddsSE)
+
+cpm <- fpm(ddsSE)
+
+mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene.annot <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                    filters = "ensembl_gene_id", 
+                    values = rownames(se), mart = mart)
+
+hgnc.annot <- gene.annot %>% 
+  filter(hgnc_symbol != '')
+
+cpm.hgnc <- cpm %>% 
+  as.data.frame() %>% 
+  rownames_to_column('ensembl_gene_id') %>% 
+  right_join(hgnc.annot) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  distinct(hgnc_symbol, .keep_all = T) %>% 
+  column_to_rownames('hgnc_symbol') %>% 
+  as.matrix()
+
+gsva.ds <- GSVA::gsva(log1p(cpm.hgnc), all_genesets, min.sz = 5)
+
+group.col <- c("#0D0887FF", "#F0F921FF")
+names(group.col) <- c('HC', 'DS')
+
+annot.col = list(Group = group.col)
+
+pheno <- as.data.frame(colData(se)) %>% 
+  dplyr::rename(Group = ds) %>% 
+  dplyr::mutate(Group = ifelse(Group == 'yes', 'DS', 'HC'))
+
+pheatmap(gsva.ds[rowLabels[which(rowLabels != '')], ], show_colnames = F, 
+         annotation_col = pheno[,2,drop=F],
+         cellheigh  = 8, fontsize = 8, cellwidth = 2, annotation_colors = annot.col)
+```
+
+```{r Gene regulatory networks}
+library(GENIE3)
+library(biomaRt)
+
+tf.list <- read_tsv('data/TFs_hg38.txt', col_names = F)
+
+# Generate count matrix
+mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene.annot <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                    filters = "ensembl_gene_id", 
+                    values = rownames(se), mart = mart)
+
+hgnc.annot <- gene.annot %>% 
+  filter(hgnc_symbol != '')
+
+count.matrix <- assay(se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('ensembl_gene_id') %>% 
+  right_join(hgnc.annot) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  distinct(hgnc_symbol, .keep_all = T) %>% 
+  column_to_rownames('hgnc_symbol')
+
+keep <- rowMeans(count.matrix > 5) > 0.1
+
+count.matrix <- count.matrix[keep,]
+
+regulators <- tf.list$X1[tf.list$X1 %in% rownames(count.matrix)]
+
+set.seed(123) # For reproducibility of results
+weightMat <- GENIE3(as.matrix(count.matrix), 
+                    regulators = regulators, 
+                    nCores = 12, verbose=TRUE)
+
+#write.table(weightMat, 'results/metabolites/regulatory_matrix.tsv', row.names = T)
+#weightMat <- read.delim('results/metabolites/regulatory_matrix.tsv', sep = ' ')
+
+x <- weightMat %>% 
+  as.data.frame() %>% 
+  rownames_to_column('transcription_factor') %>% 
+  pivot_longer(-transcription_factor, names_to = 'target_gene', 
+               values_to = 'weight')
+
+linkList <- getLinkList(weightMat, threshold=0.1)
+
+```
+
+```{r Heatmap 3 groups Pan vaccine}
+#remotes::install_github("RGLab/ImmuneSignatures2")
+library("ImmuneSignatures2")
+library(ComplexHeatmap)
+library(parallel)
+library(tidyverse)
+
+young.NoResp <- readRDS("data/immunospace/young_norm_eset.rds")
+
+data("all_genesets", package = "ImmuneSignatures2")
+
+batch <- interaction(young.NoResp$study_accession,
+                     young.NoResp$matrix,
+                     drop = TRUE)
+
+scaledMat <- by(data = t(exprs(young.NoResp)),
+                INDICES = batch,
+                FUN = function(x) scale(x)) %>%
+  do.call(what = rbind) %>%
+  t()
+
+scaledMat <- scaledMat[, sampleNames(young.NoResp)]
+# SLEA (Ref: Lopez-Bigas N. et al. (2008) Genome Biol.)
+B=100
+flag <- lapply(all_genesets, FUN = intersect, y = rownames(scaledMat)) %>%
+  sapply(FUN = length)
+
+zscoreMat <- sapply(all_genesets, FUN = function(gs) {
+  gs <- intersect(gs, rownames(scaledMat))
+  ngenes <- length(gs)
+  mu <- colMeans(scaledMat[gs, , drop = FALSE], na.rm = TRUE)
+  muPermut <- mclapply(1:B, FUN = function(seed) {
+    set.seed(seed = seed)
+    muHat <- colMeans(scaledMat[sample.int(nrow(scaledMat), ngenes), , 
+                                drop = FALSE],
+                      na.rm = TRUE)
+    return(value = muHat)
+  })
+  muPermut <- do.call(what = rbind, args = muPermut)
+  zscore <- (mu - colMeans(muPermut, na.rm = TRUE)) /
+    apply(muPermut, MARGIN = 2, FUN = sd, na.rm = TRUE)
+  return(value = zscore)
+})
+
+sleaSet <- ExpressionSet(assayData = t(zscoreMat),
+                         phenoData = AnnotatedDataFrame(pData(young.NoResp)))
+#save(sleaSet, file = 'data/immunospace/sleaSet.rds')
+
+inflamGS <- c("HALLMARK_INFLAMMATORY_RESPONSE",
+              "HALLMARK_COMPLEMENT",
+              "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+              "HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+
+#### Figure 2. Heatmap of SLEA zscore on pre-vaccination samples
+# filter SLEA zscore on pre-vaccination samples
+zscoreTemp <- exprs(sleaSet)[, sleaSet$study_time_collected <= 0]
+# remove genesets with missing symbols in virtual study
+zscoreTemp <- zscoreTemp[rowMeans(is.na(zscoreTemp)) < 1, ]
+# cutree into three groups (see gap statistic analysis
+set.seed(seed = 17)
+tree_col  <- kmeans(x = t(zscoreTemp), centers = 3)
+gr <- tree_col$cluster
+# relabel cluster based on inflammatory genesets
+inflamLS <- c("HALLMARK_INFLAMMATORY_RESPONSE",
+              "HALLMARK_COMPLEMENT",
+              "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+              "HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+
+inflamDF <- data.frame(mu = apply(zscoreTemp[inflamLS, ], MARGIN = 2, FUN = median)) %>%
+  rownames_to_column()
+
+inflamDF <- data.frame(grn = gr) %>%
+  rownames_to_column() %>%
+  merge(x = inflamDF) %>%
+  merge(y    = dplyr::select(pData(sleaSet),
+                      setdiff(varLabels(sleaSet), "gr")),
+        by.x = "rowname",
+        by.y = "uid")
+
+inflamDF %>%
+  group_by(grn) %>%
+  summarize(q2 = median(mu)) %>%
+  ungroup() %>%
+  mutate(gr = ifelse(q2 %in% min(q2),
+                     yes = "low",
+                     no  = NA),
+         gr = ifelse(q2 %in% max(q2) & is.na(gr),
+                     yes = "high",
+                     no  = gr),
+         gr = ifelse(is.na(gr),
+                     yes = "mid",
+                     no  = gr),
+         gr = factor(gr, levels = c("low", "mid", "high"))) %>%
+  merge(x = inflamDF,
+        by = "grn") %>%
+  column_to_rownames(var = "rowname") -> inflamDF
+
+inflamDF <- inflamDF[colnames(zscoreTemp), ]
+
+rowLabels <- rownames(zscoreTemp)
+
+rowLabels[!grepl(pattern = "B.cell|E2F|T.cell|MYC| NK",
+         rownames(zscoreTemp),
+         ignore.case = TRUE) &
+        !grepl(pattern = "Interferon|STAT|migration|Monocytes| DC|Neutrophiles",
+           rownames(zscoreTemp),
+                 ignore.case = TRUE) &
+            !(rownames(zscoreTemp) %in% inflamLS)] <- ""
+
+# generate heatmap annotation
+ha <- inflamDF %>%
+  rownames_to_column() %>%
+  mutate(inflam.gs = findInterval(mu, vec = quantile(mu, probs = c(0, 0.33, 0.66, 1)),
+                                  rightmost.closed= TRUE), 
+         inflam.gs = paste0("tier", inflam.gs)) %>%
+  dplyr::select(rowname, inflam.gs) %>%
+  column_to_rownames() %>%
+  .[colnames(zscoreTemp), , drop=FALSE] %>%
+  HeatmapAnnotation(df = .,
+                    col = list(inflam.gs = c(tier1 = "yellow", 
+                                             tier2 = "orange", 
+                                             tier3 = "red")))
+
+heat <- Heatmap(matrix = zscoreTemp[!(rowLabels %in% ""), ],
+                row_names_side = "left", 
+                show_column_names = FALSE,
+                column_split = inflamDF$gr,
+                show_row_dend = FALSE,
+                name = "SLEA z-score",
+                #row_labels = rowLabels,
+                row_names_gp = gpar(fontsize = 8),
+                top_annotation = ha)
+
+ht <- draw(heat)
+
+```
+
+```{r VST Transformation - Down Syndrome}
+library(biomaRt)
+library(DESeq2)
+mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene.annot <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                    filters = "ensembl_gene_id", 
+                    values = rownames(se), mart = mart)
+
+hgnc.annot <- gene.annot %>% 
+  filter(hgnc_symbol != '')
+
+count.matrix <- assay(se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('ensembl_gene_id') %>% 
+  right_join(hgnc.annot) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  distinct(hgnc_symbol, .keep_all = T) %>% 
+  column_to_rownames('hgnc_symbol')
+
+pheno <- as.data.frame(colData(se)) %>% 
+  mutate(ds = factor(ds, levels = c('no', 'yes')))
+
+dds <- DESeqDataSetFromMatrix(countData = count.matrix,
+                              colData = pheno,
+                              design = ~ ds)
+
+dds <- DESeq(dds)
+
+dds.vst <- varianceStabilizingTransformation(dds)
+
+ds.vst <- assay(dds.vst)
+
+ds.vst.df <- ds.vst %>% 
+  as.data.frame() %>% 
+  rownames_to_column('genesymbol')
+
+#write_tsv(ds.vst.df, 'data/rna-seq/counts_vst_norm.tsv')
+```
+
+```{r}
+#remotes::install_github("RGLab/ImmuneSignatures2")
+library("ImmuneSignatures2")
+library(ComplexHeatmap)
+library(parallel)
+library(tidyverse)
+
+young.NoResp <- readRDS("data/immunospace/young_norm_eset.rds")
+young.NoNorm.NoResp <- readRDS("data/immunospace/young_noNorm_eset.rds")
+
+# Norm young
+counts <- assay(young.NoResp)
+
+se <- SummarizedExperiment(counts,
+                           colData = phenoData(young.NoResp)@data)
+
+norm.pca.plot <- DESeq2::plotPCA(DESeqTransform(se), 
+                                 intgroup = 'featureSetName2', ntop = Inf)
+
+# Norm total (subseting young and genes from young object)
+young.test <- readRDS("data/ImmuneSignatures2/young_norm_eset.rds")
+
+counts.test <- assay(young.test)
+
+se.test <- SummarizedExperiment(counts.test,
+                                colData = phenoData(young.test)@data)
+
+norm.test.pca.plot <- DESeq2::plotPCA(DESeqTransform(se.test), 
+                                 intgroup = 'featureSetName2', ntop = Inf)
+
+norm.test.pca.plot.pathogen <- DESeq2::plotPCA(DESeqTransform(se.test), 
+                                               intgroup = 'pathogen', ntop = Inf)
+
+
+
+### Norm + Down syndrome
+counts.ds <- merge(counts, ds.vst, by = 'row.names') %>% 
+  column_to_rownames('Row.names') %>% 
+  as.matrix()
+
+pheno.ds <- data.frame(names = colnames(ds.vst), 
+                       featureSetName2 = 'RNA-seq DS Cohort') %>%
+  column_to_rownames('names')
+  
+pheno <- phenoData(young.NoResp)@data %>% 
+  dplyr::select(featureSetName2) %>% 
+  bind_rows(pheno.ds)
+
+se.ds <- SummarizedExperiment(counts.ds, colData = pheno)
+
+ds.pca.plot <- DESeq2::plotPCA(DESeqTransform(se.ds), 
+                               intgroup = 'featureSetName2', ntop = Inf)
+
+## Heatmap
+#data("all_genesets", package = "ImmuneSignatures2")
+
+young.NoResp <- readRDS("data/ImmuneSignatures2/young_norm_eset.rds")
+
+batch <- interaction(young.NoResp$study_accession,
+                     young.NoResp$matrix,
+                     drop = TRUE)
+
+scaledMat <- by(data = t(exprs(young.NoResp)),
+                INDICES = batch,
+                FUN = function(x) scale(x)) %>%
+  do.call(what = rbind) %>%
+  t()
+
+scaledMat <- scaledMat[, sampleNames(young.NoResp)]
+# SLEA (Ref: Lopez-Bigas N. et al. (2008) Genome Biol.)
+B=100
+flag <- lapply(all_genesets, FUN = intersect, y = rownames(scaledMat)) %>%
+  sapply(FUN = length)
+
+zscoreMat <- sapply(all_genesets, FUN = function(gs) {
+  gs <- intersect(gs, rownames(scaledMat))
+  ngenes <- length(gs)
+  mu <- colMeans(scaledMat[gs, , drop = FALSE], na.rm = TRUE)
+  muPermut <- mclapply(1:B, FUN = function(seed) {
+    set.seed(seed = seed)
+    muHat <- colMeans(scaledMat[sample.int(nrow(scaledMat), ngenes), , 
+                                drop = FALSE],
+                      na.rm = TRUE)
+    return(value = muHat)
+  })
+  muPermut <- do.call(what = rbind, args = muPermut)
+  zscore <- (mu - colMeans(muPermut, na.rm = TRUE)) /
+    apply(muPermut, MARGIN = 2, FUN = sd, na.rm = TRUE)
+  return(value = zscore)
+})
+
+sleaSet <- ExpressionSet(assayData = t(zscoreMat),
+                         phenoData = AnnotatedDataFrame(pData(young.NoResp)))
+save(sleaSet, file = 'data/immunospace/sleaSet_ds.rds')
+
+inflamGS <- c("HALLMARK_INFLAMMATORY_RESPONSE",
+              "HALLMARK_COMPLEMENT",
+              "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+              "HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+
+#### Figure 2. Heatmap of SLEA zscore on pre-vaccination samples
+# filter SLEA zscore on pre-vaccination samples
+zscoreTemp <- exprs(sleaSet)[, sleaSet$study_time_collected <= 0]
+# remove genesets with missing symbols in virtual study
+zscoreTemp <- zscoreTemp[rowMeans(is.na(zscoreTemp)) < 1, ]
+# cutree into three groups (see gap statistic analysis
+set.seed(seed = 17)
+tree_col  <- kmeans(x = t(zscoreTemp), centers = 3)
+gr <- tree_col$cluster
+# relabel cluster based on inflammatory genesets
+inflamLS <- c("HALLMARK_INFLAMMATORY_RESPONSE",
+              "HALLMARK_COMPLEMENT",
+              "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+              "HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+
+inflamDF <- data.frame(mu = apply(zscoreTemp[inflamLS, ], MARGIN = 2, FUN = median)) %>%
+  rownames_to_column()
+
+inflamDF <- data.frame(grn = gr) %>%
+  rownames_to_column() %>%
+  merge(x = inflamDF) %>%
+  merge(y    = select(pData(sleaSet),
+                      setdiff(varLabels(sleaSet), "gr")),
+        by.x = "rowname",
+        by.y = "uid")
+
+inflamDF %>%
+  group_by(grn) %>%
+  summarize(q2 = median(mu)) %>%
+  ungroup() %>%
+  mutate(gr = ifelse(q2 %in% min(q2),
+                     yes = "low",
+                     no  = NA),
+         gr = ifelse(q2 %in% max(q2) & is.na(gr),
+                     yes = "high",
+                     no  = gr),
+         gr = ifelse(is.na(gr),
+                     yes = "mid",
+                     no  = gr),
+         gr = factor(gr, levels = c("low", "mid", "high"))) %>%
+  merge(x = inflamDF,
+        by = "grn") %>%
+  column_to_rownames(var = "rowname") -> inflamDF
+
+inflamDF <- inflamDF[colnames(zscoreTemp), ]
+
+rowLabels <- rownames(zscoreTemp)
+
+rowLabels[!grepl(pattern = "B.cell|E2F|T.cell|MYC| NK",
+         rownames(zscoreTemp),
+         ignore.case = TRUE) &
+        !grepl(pattern = "Interferon|STAT|migration|Monocytes| DC|Neutrophiles",
+           rownames(zscoreTemp),
+                 ignore.case = TRUE) &
+            !(rownames(zscoreTemp) %in% inflamLS)] <- ""
+
+# generate heatmap annotation
+ha <- inflamDF %>%
+  rownames_to_column() %>%
+  mutate(inflam.gs = findInterval(mu, vec = quantile(mu, probs = c(0, 0.33, 0.66, 1)),
+                                  rightmost.closed= TRUE), 
+         inflam.gs = paste0("tier", inflam.gs),
+         patient = sub('.*\\.', '', participant_id)) %>% 
+  left_join(as.data.frame(colData(se)) %>% select(patient,ds)) %>% 
+  mutate(ds = ifelse(grepl('SUB000000', rowname), ds, NA)) %>% 
+  select(rowname, inflam.gs, ds) %>% 
+  column_to_rownames() %>%
+  .[colnames(zscoreTemp), , drop=FALSE] %>% 
+  HeatmapAnnotation(df = .,
+                    col = list(inflam.gs = c(tier1 = "yellow", 
+                                             tier2 = "orange", 
+                                             tier3 = "red"),
+                               ds = c(yes = 'yellow',
+                                          no = 'blue')))
+
+heat <- Heatmap(matrix = zscoreTemp[!(rowLabels %in% ""), ],
+                row_names_side = "left", 
+                show_column_names = FALSE,
+                column_split = inflamDF$gr,
+                show_row_dend = FALSE,
+                name = "SLEA z-score",
+                #row_labels = rowLabels,
+                row_names_gp = gpar(fontsize = 8),
+                top_annotation = ha)
+
+ht <- draw(heat)
+```
+

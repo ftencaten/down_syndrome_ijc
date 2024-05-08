@@ -1,0 +1,207 @@
+---
+title: "Data integration"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+library(omicade4)
+library(biomaRt)
+```
+
+```{r Load files}
+ds.ma <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+```
+
+```{r}
+# Cytokines
+cytok.df <- log2(ds.ma[['MSD.plasma']] + 1)
+
+# Metabolites
+metab.se <- ds.ma[['Metabolites']]
+metab.df <- assay(metab.se) %>% 
+  as.data.frame() %>% 
+  mutate(across(everything(), ~ifelse(is.na(.), 0, .)))
+
+# Bulk RNA-seq
+rnaseq.se <- ds.ma[['Bulk.RNAseq']]
+
+ddsSE <- DESeq2::DESeqDataSet(rnaseq.se, design = ~ ds)
+
+ddsSE <- DESeq2::estimateSizeFactors(ddsSE)
+
+#cpm <- log2(DESeq2::fpm(ddsSE) + 1)
+cpm <- DESeq2::fpm(ddsSE) 
+
+cpm.var <- apply(cpm, 1, var)
+selectedGenes <- names(cpm.var[order(cpm.var, decreasing = T)][1:1000])
+
+mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene.annot <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                    filters = "ensembl_gene_id", 
+                    values = selectedGenes, mart = mart)
+
+hgnc.annot <- gene.annot %>% 
+  filter(hgnc_symbol != '')
+
+rnaseq.df <- cpm[selectedGenes,] %>% 
+  as.data.frame() %>% 
+  rownames_to_column('ensembl_gene_id') %>% 
+  pivot_longer(-ensembl_gene_id) %>% 
+  mutate(name = sub('.*_', '', name)) %>% 
+  mutate(name = paste0(name, '_V2')) %>% 
+  left_join(hgnc.annot) %>% 
+  mutate(hgnc_symbol = ifelse(is.na(hgnc_symbol), ensembl_gene_id, hgnc_symbol)) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  pivot_wider(names_from = name, values_from = value) %>% 
+  column_to_rownames('hgnc_symbol')
+
+### Pathseq ----
+## RNA
+pathseq.rna.se <- ds.ma[['Pathseq.RNA']]
+
+TAX.rna = phyloseq::tax_table(as.matrix(rowData(pathseq.rna.se)))
+
+OTU.rna = phyloseq::otu_table(assay(pathseq.rna.se), taxa_are_rows = TRUE)
+
+SMPL.rna <- phyloseq::sample_data(as.data.frame(colData(pathseq.rna.se)))
+
+# Create phyloseq object
+physeq.species.rna = phyloseq::phyloseq(OTU.rna, TAX.rna, SMPL.rna)
+
+physeq.species.rna.samples <- physeq.species.rna %>% 
+  phyloseq::subset_samples(group == "experimentalGroup")
+
+physeq.species.rna.control <- physeq.species.rna %>% 
+  phyloseq::subset_samples(group == "WaterControl")
+
+z <- physeq.species.rna.samples@otu_table -  as.vector(physeq.species.rna.control@otu_table[,2])
+
+new.otu <- z %>% 
+  as.data.frame() %>% 
+  mutate(across(everything(), ~ifelse(. < 0, 0, .)))
+
+physeq.species.rna@otu_table <- phyloseq::otu_table(new.otu, taxa_are_rows = TRUE)
+
+pseq <- physeq.species.rna %>% 
+  microbiome::transform(transform = "compositional") 
+
+pseq.var <- apply(pseq@otu_table, 1, var)
+selectedspecies.rna <- names(pseq.var[order(pseq.var, decreasing = T)][1:500])
+
+pathseq.rna.df <- as.data.frame(pseq@otu_table[selectedspecies.rna,])
+
+## DNA
+pathseq.dna.se <- ds.ma[['Pathseq.DNA']]
+
+TAX.dna = phyloseq::tax_table(as.matrix(rowData(pathseq.dna.se)))
+
+OTU.dna = phyloseq::otu_table(assay(pathseq.dna.se), taxa_are_rows = TRUE)
+
+SMPL.dna <- phyloseq::sample_data(as.data.frame(colData(pathseq.dna.se)))
+
+physeq.species.dna = phyloseq::phyloseq(OTU.dna, TAX.dna, SMPL.dna)
+
+physeq.species.dna.samples <- physeq.species.dna %>% 
+  phyloseq::subset_samples(group == "experimentalGroup")
+
+physeq.species.dna.control <- physeq.species.dna %>% 
+  phyloseq::subset_samples(group == "WaterControl")
+
+z <- physeq.species.dna.samples@otu_table -  as.vector(physeq.species.dna.control@otu_table[,2])
+
+new.otu <- z %>% 
+  as.data.frame() %>% 
+  mutate(across(everything(), ~ifelse(. < 0, 0, .)))
+
+physeq.species.dna@otu_table <- phyloseq::otu_table(new.otu, taxa_are_rows = TRUE)
+
+pseq <- physeq.species.dna %>% 
+  microbiome::transform(transform = "compositional") 
+
+pseq.var <- apply(pseq@otu_table, 1, var)
+selectedspecies.dna <- names(pseq.var[order(pseq.var, decreasing = T)][1:500])
+
+pathseq.dna.df <- as.data.frame(pseq@otu_table[selectedspecies.dna,])
+```
+
+```{r MCIA}
+sampleid <- colnames(metab.df)[-107]
+
+intr.list <- list(#cytok = cytok.df[,sampleid],
+                  metab = metab.df[,sampleid],
+                  rna.seq = rnaseq.df[,sampleid])
+
+mcia.ds <- mcia(intr.list, cia.nf = 5)
+
+sampledid <- colnames(intr.list$metab)
+
+pheno <- colData(ds.ma) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('subject') %>% 
+  dplyr::select(subject, ds) %>% 
+  mutate(sample = paste0(subject, '_V2')) %>% 
+  filter(sample %in% all_of(sampleid)) %>% 
+  dplyr::select(-subject) %>% 
+  column_to_rownames('sample')
+
+plot(mcia.ds, axes = c(1,2))
+
+plot(mcia.ds, axes = c(1,2), phenovec = as.matrix(pheno), 
+                  sample.lab=FALSE, df.color = 1:2, font.size = 2, 
+                  sample.legend = F, gene.nlab = 2, 
+     sample.color = c("#0D0887FF", "#F0F921FF")[factor(pheno$ds)])
+```
+
+```{r MOFA}
+library(MOFA2)
+## Data preparation ----
+# Metabolites
+metab.se <- ds.ma[['Metabolites']]
+metab.df <- assay(metab.se) %>% 
+  as.data.frame() 
+
+# Bulk RNA-seq
+rnaseq.se <- ds.ma[['Bulk.RNAseq']]
+
+ddsSE <- DESeq2::DESeqDataSet(rnaseq.se, design = ~ ds)
+
+ddsSE <- DESeq2::estimateSizeFactors(ddsSE)
+
+#cpm <- log2(DESeq2::fpm(ddsSE) + 1)
+cpm <- DESeq2::fpm(ddsSE) 
+
+cpm.var <- apply(cpm, 1, var)
+selectedGenes <- names(cpm.var[order(cpm.var, decreasing = T)][1:1000])
+
+mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene.annot <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                    filters = "ensembl_gene_id", 
+                    values = selectedGenes, mart = mart)
+
+hgnc.annot <- gene.annot %>% 
+  dplyr::filter(hgnc_symbol != '')
+
+rnaseq.df <- cpm[selectedGenes,] %>% 
+  as.data.frame() %>% 
+  rownames_to_column('ensembl_gene_id') %>% 
+  pivot_longer(-ensembl_gene_id) %>% 
+  mutate(name = sub('.*_', '', name)) %>% 
+  mutate(name = paste0(name, '_V2')) %>% 
+  left_join(hgnc.annot) %>% 
+  mutate(hgnc_symbol = ifelse(is.na(hgnc_symbol), ensembl_gene_id, hgnc_symbol)) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  pivot_wider(names_from = name, values_from = value) %>% 
+  column_to_rownames('hgnc_symbol')
+
+
+## Factor Analysis ----
+sampleid <- colnames(metab.df)[-107]
+
+data.df <- list(metabolome = as.matrix(metab.df[, sampleid]), 
+                rnaseq = as.matrix(log1p(rnaseq.df[, sampleid])))
+
+MOFAobject <- create_mofa(data.df)
+```
+

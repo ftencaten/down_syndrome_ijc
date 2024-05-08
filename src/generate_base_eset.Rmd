@@ -1,0 +1,400 @@
+---
+title: "ImmuneSignatures2: Generating Base ExpressionSet from ImmuneSpace Data"
+author: "Evan Henrich and Helen Miller"
+output: 
+  html_document: 
+    toc: true
+    toc_float: true
+    df_print: paged
+params: 
+  outputDir: "data/ImmuneSignatures2/html_outputs"
+  dataCacheDir: "data/ImmuneSignatures2"
+  timestamp: ""
+editor_options: 
+  chunk_output_type: console
+---
+
+# Overview
+The purpose of this vignette is to generate a base expressionSet object with transcriptomic and immune response data for a number of studies from the ImmuneSpace portal, www.immunespace.org.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, include = TRUE)
+suppressPackageStartupMessages({
+  library(ImmuneSignatures2) # vaccine map loaded as `vaccines`
+  library(ImmuneSpaceR) 
+  library(Rlabkey)
+  library(Biobase)
+  library(data.table)
+  library(limma)
+  library(dplyr)
+})
+# Output variables
+outputDir <- params$outputDir
+dataCacheDir <- params$dataCacheDir
+if (!dir.exists(outputDir)) dir.create(outputDir, recursive = TRUE)
+if (!dir.exists(dataCacheDir)) dir.create(dataCacheDir)
+timeStamp <- params$timestamp
+```
+
+The ImmuneSignatures group selected a number of studies based on the diseases studied, study design and data availability.  For some studies there were cohorts that were excluded due to different vaccination methods, lack of stimulation, or different cell types.
+
+```{r global-variables}
+# Set up list for keeping track of consort numbers
+consort_numbers <- data.table(
+  step = c("immunespace total transcriptomic samples", 
+           "immunespace curated dataset",
+           "drop cohorts",
+           "drop samples due to difference in time design",
+           "remove subjects without baseline", 
+           "QC (remove saline samples)",
+           "Normalize: remove studies without young cohort", 
+           "Young adult dataset", 
+           "Older adult dataset"),
+  studies_remaining = as.numeric(NA),
+  studies_affected = as.numeric(NA),
+  studies_dropped = as.numeric(NA),
+  cohorts_remaining = as.numeric(NA),
+  cohorts_affected = as.numeric(NA),
+  cohorts_dropped = as.numeric(NA),
+  subjects_remaining = as.numeric(NA),
+  subjects_affected = as.numeric(NA),
+  subjects_dropped = as.numeric(NA),
+  samples_remaining = as.numeric(NA),
+  samples_affected = as.numeric(NA),
+  samples_dropped = as.numeric(NA)
+  )
+
+
+
+summarizeEset <- function(eset) {
+  d <- pData(eset)
+  study_count <- length(unique(d$study_accession))
+  arm_count <- length(unique(d$arm_accession))
+  cohort_count <- length(unique(d$cohort))
+  cohort_count <- max(arm_count, cohort_count)
+  # subject_count <- length(unique(gsub("\\.\\d+", "", d$participant_id)))
+  subject_count <- length(unique(d$participant_id))
+  sample_count <- length(unique(d$biosample_accession))
+  summary_dataset <- data.table(
+    studies = study_count,
+    cohorts = cohort_count, 
+    subjects = subject_count, 
+    samples = sample_count)
+  return(summary_dataset)
+}
+
+summarizeEsetList <- function(esetList, con) {
+  pdList <- lapply(esetList, pData)
+  d <- rbindlist(pdList)
+  if (!"arm_accession" %in% names(d)) {
+    gef <- con$getDataset("gene_expression_files", original_view = TRUE)
+    d <- merge(d, unique(gef[, .(participant_id, arm_accession, study_accession)]), all.x = TRUE, all.y = FALSE)
+  }
+  study_count <- length(unique(d$study_accession))
+  cohort_count <- length(unique(d$arm_accession))
+  # subject_count <- length(unique(gsub("\\.\\d+", "", d$participant_id)))
+  subject_count <- length(unique(d$participant_id))
+  sample_count <- length(unique(d$biosample_accession))
+  summary_dataset <- data.table(
+    studies = study_count,
+    cohorts = cohort_count, 
+    subjects = subject_count, 
+    samples = sample_count)
+  return(summary_dataset)
+}
+
+
+con <- CreateConnection("IS2", onTest = FALSE)
+```
+
+```{r get-total-numbers}
+con_all <- CreateConnection("", onTest = FALSE)
+gef <- con_all$getDataset("gene_expression_files", original_view = TRUE)
+consort_numbers[step == "immunespace total transcriptomic samples", 
+                `:=`(
+                  studies_remaining = length(unique(gef$study_accession)),
+                  cohorts_remaining = length(unique(gef$arm_accession)),
+                  subjects_remaining = length(unique(gef$participant_id)),
+                  samples_remaining = length(unique(gef$biosample_accession))
+                )]
+rm(con_all, gef)
+```
+
+```{r load-esets}
+geMatrices <- con$cache$GE_matrices
+esets <- readRDS(file.path(dataCacheDir, paste0(timeStamp, "IS2_esets.rds")))
+```
+
+```{r load-immdata-and-metadata}
+immdata_all <- readRDS( file.path(dataCacheDir, paste0(timeStamp, "immdata_all.rds")) )
+sharedMetaData <- readRDS( file.path(dataCacheDir, paste0(timeStamp, "sharedMetaData.rds")) )
+
+demographics <- con$getDataset("demographics")
+geneExpressionFiles <- con$getDataset("gene_expression_files", original_view = TRUE)
+featureAnnotationMap <- getTable(con, "microarray", "fasMap", showHidden = TRUE)
+featureAnnotation <- getTable(con, "microarray", "FeatureAnnotationSet", showHidden = TRUE)
+```
+
+Full dataset: 
+```{r summarize-all}
+full_summary <- summarizeEsetList(c(esets), con)
+consort_numbers[step == "immunespace curated dataset", 
+                `:=`(studies_remaining = full_summary$studies,
+                     cohorts_remaining = full_summary$cohorts,
+                     subjects_remaining = full_summary$subjects,
+                     samples_remaining = full_summary$samples)]
+```
+
+Analysis cohorts: 
+```{r summarize-kept}
+remaining_summary <- summarizeEsetList(esets, con)
+consort_numbers[step == "drop cohorts", 
+                `:=`(studies_remaining = remaining_summary$studies,
+                     cohorts_remaining = remaining_summary$cohorts,
+                     subjects_remaining = remaining_summary$subjects,
+                     samples_remaining = remaining_summary$samples, 
+                     studies_dropped = full_summary$studies - remaining_summary$studies,
+                     cohorts_dropped = full_summary$cohorts - remaining_summary$cohorts,
+                     subjects_dropped = full_summary$subjects - remaining_summary$subjects,
+                     samples_dropped = full_summary$samples - remaining_summary$samples)]
+remaining_summary
+```
+
+# Fix problem samples due to difference in time design
+
+There are some samples that are removed prior to the summarization of the transcriptomic data from the probe level to the gene symbol level.  The reason for removal is noted for each study.
+
+```{r remove-unused-samples-from-esets-pre-summarization}
+esets <- lapply(esets, function(eset){
+  pData(eset) <- addStudy(pData(eset))
+  return(eset)
+})
+
+esets_pre <- esets
+
+# SDY1325 - Day 35, 7 days post booster but no day 28 data to create new baseline
+esets <- removeTimepointFromEset(esets, "SDY1325", 35)
+
+# SDY1293 - Day 0, using last vaccination on Day 60 as new Day 0
+esets <- removeTimepointFromEset(esets, "SDY1293", 0)
+
+# SDY180 - Hourly data generates non-matching duplicates for early timepoints
+esets <- removeTimepointFromEset(esets, "SDY180", "Hours")
+
+# Study authors of SDY212 cannot explain why one sample is missing some data
+esets <- removeSDY212MissingSample(esets)
+
+esets <- lapply(esets, function(eset){
+  pd <- pData(eset)
+  pd <- correctHrs(pd)
+  pd <- addTimePostLastVax(pd)
+  pData(eset) <- pd
+  return(eset)
+})
+
+result_summary <- summarizeEsetList(esets, con)
+result_summary
+
+# Get subjects affected
+pdata_pre <- rbindlist(lapply(esets_pre, pData))
+pdata_post <- rbindlist(lapply(esets, pData))
+subject_counts_pre <- pdata_pre[, .(n_pre = .N), participant_id]
+subject_counts_post <- pdata_post[, .(n_post = .N), .(participant_id, study_accession)]
+subject_counts <- merge(subject_counts_pre, subject_counts_post)
+subject_counts <- merge(subject_counts, geneExpressionFiles[, .(arm_accession, participant_id)])
+
+consort_numbers[step == "drop samples due to difference in time design", 
+                `:=`(studies_remaining = result_summary$studies,
+                     cohorts_remaining = result_summary$cohorts,
+                     subjects_remaining = result_summary$subjects,
+                     samples_remaining = result_summary$samples,
+                     studies_affected = 4,
+                     cohorts_affected = nrow(subject_counts[n_pre != n_post][, .N, arm_accession]),
+                     subjects_affected = unique(subject_counts[n_pre != n_post])[, .N],
+                     samples_affected = remaining_summary$samples - result_summary$samples,
+                     studies_dropped = remaining_summary$studies - result_summary$studies,
+                     cohorts_dropped = remaining_summary$cohorts - result_summary$cohorts,
+                     subjects_dropped = remaining_summary$subjects - result_summary$subjects,
+                     samples_dropped = remaining_summary$samples - result_summary$samples)]
+
+rm(esets_pre)
+
+```
+
+```{r prepare-gene-expression-meta-data}
+
+phenoDataSets <- lapply(esets, pData)
+phenoDataSets <- addMatrixRelatedFields(phenoDataSets, geMatrices)
+
+geMetaData <- rbindlist(phenoDataSets)
+
+# Adds vaccine and age_imputed
+# First remove "Old" vs "Young" cohort name from sharedMetaData
+geMetaData <- merge(geMetaData, sharedMetaData[, -"cohort"], 
+                    by = c("participant_id", "study_accession"))
+
+geMetaData <- addFeatureAnnotationSetName(geMetaData, featureAnnotationMap)
+geMetaData <- addFeatureAnnotationSetVendor(geMetaData, featureAnnotation)
+geMetaData <- addCoalescedFeatureSetName(geMetaData)
+geMetaData <- addGSMAccessions(geMetaData, geneExpressionFiles)
+geMetaData <- createUniqueIdColumn(geMetaData)
+geMetaData <- addAnalysisVariables(geMetaData)
+geMetaData <- subsetToOnlyNeededColumns(geMetaData)
+```
+
+A subset of studies created by HIPC collaborators at Yale University have "study_time_collected" values that do not align with the intended "visit_day" value.  These are manually corrected here.
+
+```{r fix-yale-studies-study-time-collected}
+geMetaData$time_post_last_vax <- as.numeric(geMetaData$time_post_last_vax)
+geMetaData <- updateStudyTimepoints(geMetaData, c("SDY400", "SDY404", "SDY520", "SDY63", "SDY640"), 24, 28)
+geMetaData <- updateStudyTimepoints(geMetaData, c("SDY400", "SDY404", "SDY520"), 3, 2)
+geMetaData <- updateStudyTimepoints(geMetaData, c("SDY400", "SDY404", "SDY520"), 8, 7)
+geMetaData <- updateStudyTimepoints(geMetaData, c("SDY400", "SDY404", "SDY520"), 9, 7)
+geMetaData <- updateStudyTimepoints(geMetaData, c("SDY63"), 5, 4)
+```
+
+```{r test-ge-metadata-pre-summarization}
+metaDataResults <- testGEMetaDataPreSummarization(geMetaData)
+if(!metaDataResults){
+  stop("Not all pre-summarization checks are passing!")
+}
+```
+
+# Create expressionset 
+
+Gene expression data is summarized from the probe level (for microarray data) and gene-alias level (RNAseq) to the canonical Gene-Symbol level using mappings from the Human Gene Ontology Network (HUGO).  The probes / gene-aliases are summarized by selecting the probe or gene-alias with the maximum mean value (no log transformation) across all samples within the matrix (cohort * cell_type).
+
+```{r summarize-gene-expression-data-by-gene-symbol}
+summarizedEsets <- summarizeByGeneSymbol(esets)
+
+allGE <- Reduce(f = function(x, y){ merge(x, y, by = "gs", all = TRUE)},
+                summarizedEsets)
+gs <- allGE$gs
+allGE[, gs := NULL ]
+```
+
+```{r match-ge-and-metadata}
+geMetaData <- geMetaData[ order(match(geMetaData$biosample_accession, colnames(allGE))), ]
+if (!all.equal(geMetaData$biosample_accession, colnames(allGE))) {
+    stop("biosample accessions do NOT match for expression data and meta-data!")
+}
+colnames(allGE) <- c(geMetaData$uid)
+allGE[, rn := gs ]
+
+```
+
+```{r pre-norm-gene-expression-tests}
+exprDataResults <- testAllGEMatrixPreNorm(allGE)
+metaDataResults <- testAllGEMetaDataPreNorm(geMetaData)
+
+if(!all(unlist(c(exprDataResults, metaDataResults)))){
+  stop("Not all pre-norm checks are passing!")
+}
+```
+
+```{r create-initial-expression-set}
+geMetaData <- as.data.frame(geMetaData)
+rownames(geMetaData) <- geMetaData$uid
+noNormEset <- new("ExpressionSet", 
+                   exprs = as.matrix(allGE, rownames = "rn"),
+                   phenoData = new('AnnotatedDataFrame', 
+                               geMetaData))
+
+summarizeEset(noNormEset)
+```
+
+Remove subjects without baseline
+
+```{r remove-subjects-without-baseline}
+pd <- pData(noNormEset)
+pdata_pre <- data.table(pd)
+
+allPids <- unique(pd$participant_id)
+pidsWithBaseline <- unique(pd$participant_id[ pd$time_post_last_vax >= -7 & pd$time_post_last_vax <= 0 ])
+pidsToRm <- setdiff(allPids, pidsWithBaseline)
+noNormEset <- noNormEset[ , !noNormEset$participant_id %in% pidsToRm ]
+
+
+# Add consort numbers
+post_baseline_summary <- summarizeEset(noNormEset)
+pdata_post <- data.table(pData(noNormEset))
+arm_counts_pre <- pdata_pre[, .(n_pre = .N), .(study_accession, arm_accession)]
+arm_counts_post <- pdata_post[, .(n_post = .N), .(study_accession, arm_accession)]
+arm_counts <- merge(arm_counts_pre, arm_counts_post, 
+                        by = c("study_accession", "arm_accession"),
+                        all = TRUE)
+
+consort_numbers[step == "remove subjects without baseline", 
+                `:=`(studies_remaining = post_baseline_summary$studies,
+                     cohorts_remaining = post_baseline_summary$cohorts,
+                     subjects_remaining = post_baseline_summary$subjects,
+                     samples_remaining = post_baseline_summary$samples,
+                     studies_affected = nrow(unique(arm_counts[n_pre != n_post])[, .N, study_accession]),
+                     cohorts_affected = unique(arm_counts[n_pre != n_post])[, .N],
+                     subjects_affected = result_summary$subjects - post_baseline_summary$subjects,
+                     samples_affected = result_summary$samples - post_baseline_summary$samples,
+                     studies_dropped = result_summary$studies - post_baseline_summary$studies,
+                     cohorts_dropped = result_summary$cohorts - post_baseline_summary$cohorts,
+                     subjects_dropped = result_summary$subjects - post_baseline_summary$subjects,
+                     samples_dropped = result_summary$samples - post_baseline_summary$samples)]
+
+```
+
+# Y-chromosome imputation
+Y-chromosome imputation is performed by using Y-Chromosome associated genes to cluster each cohort into two groups and then assigning groups to either y-chromosome positive or negative based on the positive group having a higher mean expression value for selected genes.  Due to some outliers with extreme values, the Y-chromosome gene expression values are mapped to a lower two-dimensional representation first before clustering.
+
+```{r ychrom-imputation}
+#clustANames <- colnames(yChromEset)[which(mdsCall == 1 )]
+
+allMatricesPlot <- qualityControl.genderByMatrix(noNormEset)
+pdf(file = file.path(outputDir, paste0(timeStamp, "baseEset_preYchromImpute.pdf")),
+    width = 8.5,
+    height = 11)
+allMatricesPlot
+dev.off()
+
+# The following code assigns probable y chromosome presence based on clustering
+# of samples given expression values for 13 Y-Chromosome genes.
+noNormEset <- imputeYchrom.useAllTimepoints(noNormEset)
+
+# Flag additional problem samples
+# Specific samples for SDY1370 were determined to be problematic by
+# looking at the coordination of y_chrom_present by timepoint
+problemSamples <- c("SUB192192.1370,","SUB192199.1370")
+noNormEset$failedYchromQC[ noNormEset$participant_id %in% problemSamples] <- TRUE
+
+failedYchromQC <- qualityControl.failedYchromQC(noNormEset)
+pdf(file = file.path(outputDir, paste0(timeStamp, "baseEset_failedYchromQCAllSubjects.pdf")),
+    width = 8.5,
+    height = 11)
+failedYchromQC
+dev.off()
+
+
+problemSamples <- noNormEset[ , noNormEset$failedYchromQC]
+problemSubjectsPlot <- qualityControl.yChromPresentByMatrix(problemSamples, 
+                                                     returnObject = "probSubjects")
+pdf(file = file.path(outputDir, paste0(timeStamp, "baseEset_failedYchromQCproblemSubjects.pdf")),
+    width = 8.5,
+    height = 11)
+problemSubjectsPlot
+dev.off()
+
+
+probStudiesBySubjectTbl <- qualityControl.createSubjectsByStudyTable(problemSamples$participant_id)
+data.frame(probStudiesBySubjectTbl)
+```
+
+```{r test-non-normalized-expression-set}
+res <- testNoNormEset(noNormEset)
+if(!all(unlist(res))){
+  warning("noNormEset does not meet expectations")
+}
+saveRDS(consort_numbers, file.path(dataCacheDir, "consort_numbers.rds"))
+saveRDS(noNormEset, file = file.path(dataCacheDir, paste0(timeStamp, "noNormEset.rds")))
+write_data_metadata(file.path(dataCacheDir, "dataset_metadata.csv"),
+                    dataset_name = "noNormEset.rds", 
+                    data_path = file.path(dataCacheDir, paste0(timeStamp, "noNormEset.rds")),
+                    data = noNormEset, 
+                    include_counts = TRUE)
+```

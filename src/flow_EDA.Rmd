@@ -1,0 +1,78 @@
+---
+title: "Down syndrome IJC - Flow cytometry analysis"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load libraries}
+library(MultiAssayExperiment)
+library(tidyverse)
+library(ggfortify)
+library(pvca)
+```
+
+```{r Load files}
+ds.ma <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+```
+
+```{r EDA}
+se.flow <- ds.ma[['Flow.cytometry']]
+
+flow.df <- assay(se.flow, 'Unstimulated') %>% 
+  as.data.frame() %>% 
+  filter(rowMeans(. < 0, na.rm = T) < 0.1) %>%  # remove flow gates with more 10% negative values (compensation problem)
+  log1p() %>% 
+  filter(rowMeans(is.na(.)) < 1/3) %>% # remove flow gates with more 1/3 NA
+  t() %>% 
+  as.data.frame() %>%  
+  mutate_all(~ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x))
+
+## PCA
+flow.pca <- autoplot(prcomp(log1p(flow.df), scale. = T), 
+         data = as.data.frame(colData(se.flow)), fill = 'DS', shape = 21, size = 3,
+         names = T, alpha = 0.8) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Flow cytometry')+
+  theme_bw()
+
+#ggsave('results/flow_cytometry/PCA_flow.pdf', flow.pca,
+#       device = 'pdf', scale = 0.4)
+
+### PVCA ----
+metadata <- colData(se.flow) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid') %>% 
+  mutate(BMI = ifelse(BMI < 5, NA, BMI)) %>% 
+  mutate(bmi_category = case_when(BMI < 18.5 ~ 'underweight',
+                                  BMI >= 18.5 & BMI < 25 ~ 'healthy',
+                                  BMI >= 25 & BMI < 30 ~ 'overweight',
+                                  BMI >= 30 ~ 'obesity',
+                                  TRUE ~ NA_character_)) %>% 
+  mutate(age_category = case_when(Age < 30 ~ 'under_30',
+                                  TRUE ~ 'over_30')) %>% 
+  column_to_rownames('sampleid') %>% 
+  select(DS, age_category, bmi_category, Sex)
+
+eset <- ExpressionSet(assayData = t(flow.df)[,rownames(metadata)], 
+                      phenoData = AnnotatedDataFrame(metadata))
+
+batch.factors <- c('DS', 'age_category', 'bmi_category', 'Sex')
+
+pvca <- pvcaBatchAssess(eset, batch.factors = batch.factors, threshold = 0.1)
+
+df <- data.frame("Prop_var" = pvca$dat[1,], "condition" = pvca$label) %>%
+          arrange(desc(Prop_var))
+
+pvca.flow <- ggplot(df, aes(x = reorder(condition,Prop_var), 
+                                   y = Prop_var)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Condition",
+         y = "Proportion of variance explained") +
+    theme_bw() +
+    coord_flip()
+
+#ggsave('results/flow_cytometry/PVCA_flow.pdf', pvca.flow,
+#       device = 'pdf', scale = 0.4)
+```
+

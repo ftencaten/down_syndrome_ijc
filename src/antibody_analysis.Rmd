@@ -1,0 +1,414 @@
+---
+title: "Antibody titer analysis"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load libraries}
+library(tidyverse)
+library(rstatix)
+library(ggpubr)
+library(MultiAssayExperiment)
+```
+
+```{r Load files}
+#ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay_20240507.rds')
+
+pheno <- as.data.frame(colData(ds.mae))
+
+abs.raw <- ds.mae[['Antibodies']] 
+
+#colData(ds.mae[['Metabolites']])
+```
+
+```{r Pre-processing}
+abs.df <- t(abs.raw) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid') %>% 
+  mutate(across(-sampleid, ~as.numeric(.)))
+
+abs.pheno <- abs.df %>% 
+  mutate(patientid = sub('_.*', '', sampleid))  |> 
+  left_join(pheno %>% 
+              rownames_to_column('patientid') %>% 
+              select(patientid, ds, age_years, sex, most_recent_event, number_events)) |> 
+  mutate(antigen_exposure = case_when(most_recent_event >= -30 ~ '1m',
+                                      most_recent_event < -30 &
+                                      most_recent_event >= -60 ~ '1-2m', 
+                                      most_recent_event < -60 &
+                                      most_recent_event >= -90 ~ '2-3m',
+                                      most_recent_event < -90 &
+                                      most_recent_event >= -180 ~ '3-6m',
+                                      most_recent_event < -180 &
+                                      most_recent_event >= -360 ~ '6-12m',
+                                      most_recent_event < -360 ~ '1y',
+                                      TRUE ~ NA)) |> 
+  mutate(antigen_exposure = factor(antigen_exposure, 
+                                   levels = c('1m', '1-2m', '2-3m', '3-6m',
+                                              '6-12m', '1y'))) |> 
+  mutate(visit = sub('.*_','',  sampleid))
+```
+
+```{r Exploratory PCA}
+autoplot(prcomp(log1p(abs.pheno[,2:9])), data = abs.pheno, shape = 21,
+         fill = 'visit', size = 3)
+
+autoplot(prcomp(log1p(abs.pheno[,2:9])), data = abs.pheno, shape = 21,
+         fill = 'ds', size = 3) +
+  scale_fill_manual(values= c('darkblue', 'yellow'))
+```
+
+```{r Initial Plots}
+pheno.days %>% 
+  filter(is.na(sarscov2_infection_1st_date)) %>% 
+  ggplot(aes(x = visit_1_from_boost_days)) + 
+  geom_histogram() +
+  facet_wrap(~ds) +
+  xlab('Visit 1 - Days from boost')
+
+pheno.days %>% 
+  filter(is.na(sarscov2_infection_1st_date)) %>% 
+  ggplot(aes(x = visit_2_from_boost_days)) + 
+  geom_histogram() +
+  facet_wrap(~ds) +
+  xlab('Visit 2 - Days from boost')
+
+pheno.days %>% filter(is.na(sarscov2_infection_1st_date), ds == 'no') %>% nrow()
+
+## Visit 2
+visit2_from_boost <- abs.pheno %>% 
+  filter(grepl('_V2', sampleid), is.na(sarscov2_infection_1st_date)) %>% 
+  filter(visit_2_from_boost_days < -180,
+         visit_2_from_boost_days > -365) %>% 
+  pivot_longer(-c(patientid, ds, age_years, sex, sarscov2_infection_1st_date,
+           visit_1_from_boost_days, visit_2_from_boost_days, sampleid, 
+           infect_first_days))
+
+visit2_from_boost.stat <- visit2_from_boost %>% 
+  group_by(name) %>% 
+  wilcox_test(value ~ ds) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  add_xy_position(y.trans = log10, step.increase = 0.2) %>% 
+  add_significance(p.col = 'p.adj')
+
+visit2_from_boost.plot <- visit2_from_boost %>% 
+  ggplot(aes(x = ds, y = value)) +
+  geom_boxplot(aes(fill = ds), alpha = 0.7, width = 0.4) +
+  geom_jitter(aes(fill = ds), width = 0.05, shape = 21)+
+  scale_y_continuous(trans = 'log10',
+                     expand = expansion(mult = c(0.05, 0.12))) +
+  facet_wrap(~name) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  stat_pvalue_manual(visit2_from_boost.stat, label = "p.adj.signif", size = 6, 
+                     bracket.nudge.y = 0.3) +
+  labs(x = '', y = 'Antibody levels') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  ggtitle('Visit 2 - Non-infected - 6-12m after boost')
+  
+#ggsave('results/antibodies/boxplot_abs_titer_visit2_noninfected_6-12m_after_boost.pdf',
+#       visit2_from_boost.plot, device = 'pdf', width = 5.3, height = 5)
+
+## Visit 1
+visit1_from_boost <- abs.pheno %>% 
+  filter(grepl('_V1', sampleid), is.na(sarscov2_infection_1st_date)) %>% 
+  filter(visit_1_from_boost_days > -180) %>% 
+  pivot_longer(-c(patientid, ds, age_years, sex, sarscov2_infection_1st_date,
+           visit_1_from_boost_days, visit_2_from_boost_days, sampleid, 
+           infect_first_days))
+
+visit1_from_boost.stat <- visit1_from_boost %>% 
+  group_by(name) %>% 
+  wilcox_test(value ~ ds) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  add_xy_position(y.trans = log10, step.increase = 0.2) %>% 
+  add_significance(p.col = 'p.adj')
+
+visit1_from_boost.plot <- visit1_from_boost %>% 
+  ggplot(aes(x = ds, y = value)) +
+  geom_boxplot(aes(fill = ds), alpha = 0.7, width = 0.4) +
+  geom_jitter(aes(fill = ds), width = 0.05, shape = 21)+
+  scale_y_continuous(trans = 'log10',
+                     expand = expansion(mult = c(0.05, 0.15))) +
+  facet_wrap(~name) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  stat_pvalue_manual(visit1_from_boost.stat, label = "p.adj.signif", size = 6, 
+                     bracket.nudge.y = 0.3) +
+  labs(x = '', y = 'Antibody levels') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  ggtitle('Visit 1 - Non-infected - 0-6m after boost')
+  
+#ggsave('results/antibodies/boxplot_abs_titer_visit1_noninfected_0-6m_after_boost.pdf',
+#       visit1_from_boost.plot, device = 'pdf', width = 5.3, height = 5)
+
+## Visit 2 all patients
+visit2 <- abs.pheno %>% 
+  filter(grepl('_V2', sampleid)) %>% 
+  pivot_longer(-c(patientid, ds, age_years, sex, sarscov2_infection_1st_date,
+           visit_1_from_boost_days, visit_2_from_boost_days, sampleid,
+           infect_first_days))
+
+visit2.stat <- visit2 %>% 
+  group_by(name) %>% 
+  wilcox_test(value ~ ds) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  add_xy_position(y.trans = log10, step.increase = 0.2) %>% 
+  add_significance(p.col = 'p.adj')
+
+visit2.plot <- visit2 %>% 
+  ggplot(aes(x = ds, y = value)) +
+  geom_boxplot(aes(fill = ds), alpha = 0.7, width = 0.4) +
+  geom_jitter(aes(fill = ds), width = 0.05, shape = 21)+
+  scale_y_continuous(trans = 'log10',
+                     expand = expansion(mult = c(0.05, 0.12))) +
+  facet_wrap(~name) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  stat_pvalue_manual(visit2.stat, label = "p.adj.signif", size = 6, 
+                     bracket.nudge.y = 0.3) +
+  labs(x = '', y = 'Antibody levels') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  ggtitle('Visit 2')
+
+### Infected visit 2
+visit2_from_boost.infct <- abs.pheno %>% 
+  filter(grepl('_V2', sampleid), !is.na(sarscov2_infection_1st_date)) %>% 
+  filter(!is.na(visit_2_from_boost_days)) %>% 
+  pivot_longer(-c(patientid, ds, age_years, sex, sarscov2_infection_1st_date,
+           visit_1_from_boost_days, visit_2_from_boost_days, sampleid,
+           infect_first_days))
+
+visit2_from_boost.infct.stat <- visit2_from_boost.infct %>% 
+  group_by(name) %>% 
+  wilcox_test(value ~ ds) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  add_xy_position(y.trans = log10, step.increase = 0.2) %>% 
+  add_significance(p.col = 'p.adj')
+
+visit2_from_boost.infect.plot <- visit2_from_boost.infct %>% 
+  ggplot(aes(x = ds, y = value)) +
+  geom_boxplot(aes(fill = ds), alpha = 0.7, width = 0.4) +
+  geom_jitter(aes(fill = ds), width = 0.05, shape = 21)+
+  scale_y_continuous(trans = 'log10',
+                     expand = expansion(mult = c(0.05, 0.12))) +
+  facet_wrap(~name) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  stat_pvalue_manual(visit2_from_boost.infct.stat, label = "p.adj.signif", size = 6, 
+                     bracket.nudge.y = 0.3) +
+  labs(x = '', y = 'Antibody levels') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  ggtitle('Visit 2 - Infected')
+  
+#ggsave('results/antibodies/boxplot_abs_titer_visit2_Infected.pdf',
+#       visit2_from_boost.infect.plot, device = 'pdf', width = 5.3, height = 5)
+```
+
+```{r Days post boost - Dotplot}
+data <- abs.pheno %>% 
+  filter(!(patientid %in% c('SMP', 371, 181)), !is.na(visit_1_from_boost_days)) %>% 
+  pivot_longer(-c(patientid, ds, age_years, sex, sarscov2_infection_1st_date,
+           visit_1_from_boost_days, visit_2_from_boost_days, sampleid,
+           infect_first_days)) %>% 
+  filter(!is.na(value)) %>% 
+  mutate(visit = sub('.*_', '', sampleid)) %>% 
+  mutate(days_from_boost = ifelse(visit == 'V1', visit_1_from_boost_days,
+                                  visit_2_from_boost_days))  %>% 
+  filter(is.na(infect_first_days)) %>% 
+  mutate(lm.group = case_when(ds == 'no' & visit_1_from_boost_days > -100 ~ 'HC.early',
+                              ds == 'no' & visit_1_from_boost_days < -100 ~ 'HC.late',
+                              ds == 'yes' ~ 'DS'))
+
+visit1visit2.plot <- data %>% 
+  ggplot(aes(y = value, x = visit)) +
+  geom_point(aes(fill = ds), shape = 21, 
+             position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.5)) +
+  geom_smooth(aes(group = ds, color = ds), method='lm', formula= y~x, se = F) +
+  scale_y_continuous(trans = 'log10') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  scale_color_manual(values = c("#0D0887FF", "#F0F921FF"), guide = 'none') +
+  facet_wrap(~name) +
+  labs(x = 'Visit', y = 'Antibody levels') +
+  theme_bw()
+
+#ggsave('results/antibodies/dotplot_abs_titer_visit1_visit2.pdf',
+#       visit1visit2.plot, device = 'pdf', width = 5.3, height = 5)
+
+days.from.boost.plot <- data %>% 
+  ggplot(aes(y = value, x = days_from_boost*-1)) +
+  geom_line(aes(group = patientid, linetype = ds), alpha = 0.1) +
+  geom_point(aes(fill = ds, shape = visit), size = 2, alpha = 0.8) +
+  scale_y_continuous(trans = 'log10') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  scale_linetype(name = 'Group', labels = c('HC', 'DS')) +
+  scale_shape_manual(values = c(21,22)) +
+  facet_wrap(~name) +
+  labs(x = 'Days post boost', y = 'Antibody levels') +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+   theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+#ggsave('results/antibodies/dotplot_days_from_boost.pdf',
+#       days.from.boost.plot, device = 'pdf', scale = 0.9)
+
+
+x <- data %>% filter(name == 'RBD (P.1)') %>% 
+  mutate(days_from_boost = days_from_boost*-1,
+         infect_first_days = infect_first_days*-1) %>% 
+  mutate(log10.value = log10(value)) 
+
+summary(lm(log10.value ~ ds*days_from_boost, data = x))
+
+model <- lmer(log10.value  ~ ds*days_from_boost + (1|patientid), data = x)
+car::Anova(model)
+
+model <- lme(log10.value  ~ ds*days_from_boost, random=~1|patientid, data = x)
+
+model.result <- data %>% 
+  mutate(days_from_boost = days_from_boost*-1,
+         infect_first_days = infect_first_days*-1) %>% 
+  mutate(log10.value = log10(value)) %>% 
+  filter(is.na(infect_first_days)) %>% 
+  group_by(name) %>% 
+  do(tidy(lm(log10.value ~ ds*days_from_boost, .)))
+```
+
+```{r Comparison V1 and V2 - boost non-infected only - same timepoints}
+data <- abs.pheno %>% 
+  filter(!(patientid %in% c('SMP', 371, 181)), !is.na(visit_1_from_boost_days)) %>% 
+  pivot_longer(-c(patientid, ds, age_years, sex, sarscov2_infection_1st_date,
+           visit_1_from_boost_days, visit_2_from_boost_days, sampleid,
+           infect_first_days)) %>% 
+  filter(!is.na(value)) %>% 
+  mutate(visit = sub('.*_', '', sampleid)) %>% 
+  mutate(days_from_boost = ifelse(visit == 'V1', visit_1_from_boost_days,
+                                  visit_2_from_boost_days))  %>% 
+  filter(is.na(infect_first_days)) %>% 
+  filter(visit_1_from_boost_days > -100)
+
+data.stat <- data %>% 
+  filter(name != 'SARS-Cov-2 N') %>% 
+  group_by(ds, name) %>% 
+  wilcox_test(value ~ visit) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  add_xy_position() %>% 
+  mutate(xmin = ifelse(ds == 'no', xmin - 0.19, xmin + 0.19),
+         xmax = ifelse(ds == 'no', xmax - 0.19, xmax + 0.19),
+         y.position = log10(y.position))
+
+compare_visit1_visit2 <- data %>% 
+  filter(name != 'SARS-Cov-2 N') %>% 
+  ggplot(aes(x = visit, y = value, fill = ds)) +
+  geom_boxplot(alpha = 0.8) +
+  geom_jitter(shape = 21, 
+              position = position_jitterdodge(jitter.width = 0.1)) +
+  stat_pvalue_manual(data.stat, 
+                     label = "p = {scales::pvalue(p.adj)}")+
+  facet_wrap(~name) +
+  scale_y_continuous(trans = 'log10', expand = expansion(mult = c(0.05, 0.25))) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  labs(x = 'Visit', y = 'ABs Titer') +
+  theme_bw()
+
+#ggsave('results/antibodies/boxplot_visits_comparison.pdf',
+#       compare_visit1_visit2, device = 'pdf', height = 5.5, width = 7)
+
+days.post.boost.same.days.plot <- data %>% 
+  ggplot(aes(y = value, x = days_from_boost*-1)) +
+  geom_line(aes(group = patientid, linetype = ds), alpha = 0.2) +
+  geom_point(aes(fill = ds, shape = visit), size = 2, alpha = 0.8) +
+  scale_y_continuous(trans = 'log10') +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  scale_linetype(name = 'Group', labels = c('HC', 'DS')) +
+  scale_shape_manual(values = c(21,22)) +
+  facet_wrap(~name) +
+  labs(x = 'Days post boost', y = 'Antibody levels') +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+   theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+#ggsave('results/antibodies/dotplot_days_post_boost_same_days.pdf',
+#       days.post.boost.same.days.plot, device = 'pdf', scale = 0.8)
+
+## Visit 1
+visit1_post_boost <- data %>% 
+  filter(visit == 'V1')
+
+visit1_post_boost.stat <- visit1_post_boost %>% 
+  group_by(name) %>% 
+  wilcox_test(value ~ ds) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  add_xy_position(y.trans = log10, step.increase = 0.2) %>% 
+  add_significance(p.col = 'p.adj')
+
+visit1_post_boost.plot <- visit1_post_boost %>% 
+  ggplot(aes(x = ds, y = value)) +
+  geom_boxplot(aes(fill = ds), alpha = 0.7, width = 0.4, outlier.shape = NA) +
+  geom_jitter(aes(fill = ds), width = 0.05, shape = 21)+
+  scale_y_continuous(trans = 'log10',
+                     expand = expansion(mult = c(0.05, 0.18))) +
+  facet_wrap(~name) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  stat_pvalue_manual(visit1_post_boost.stat, size = 4, 
+                     bracket.nudge.y = 0.3, vjust = -0.3,
+                     label = "p.adj = {scales::pvalue(p.adj)}") +
+  labs(x = '', y = 'Antibody levels') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  ggtitle('Visit 1 - Non-infected')
+
+#ggsave('results/antibodies/boxplot_abs_titer_visit1_noninfected.pdf',
+#       visit1_post_boost.plot, device = 'pdf', width = 5.3, height = 5)
+
+## Visit 2
+visit2_post_boost <- data %>% 
+  filter(visit == 'V2')
+
+visit2_post_boost.stat <- visit2_post_boost %>% 
+  group_by(name) %>% 
+  wilcox_test(value ~ ds) %>% 
+  adjust_pvalue(p.col = 'p', method = 'BH') %>% 
+  add_xy_position(y.trans = log10, step.increase = 0.2) %>% 
+  add_significance(p.col = 'p.adj')
+
+visit2_post_boost.plot <- visit2_post_boost %>% 
+  ggplot(aes(x = ds, y = value)) +
+  geom_boxplot(aes(fill = ds), alpha = 0.7, width = 0.4, outlier.shape = NA) +
+  geom_jitter(aes(fill = ds), width = 0.05, shape = 21)+
+  scale_y_continuous(trans = 'log10',
+                     expand = expansion(mult = c(0.05, 0.18))) +
+  facet_wrap(~name) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  stat_pvalue_manual(visit2_post_boost.stat, size = 4, 
+                     bracket.nudge.y = 0.3, vjust = -0.3,
+                     label = "p.adj = {scales::pvalue(p.adj)}") +
+  labs(x = '', y = 'Antibody levels') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  ggtitle('Visit2 - Non-infected')
+
+#ggsave('results/antibodies/boxplot_abs_titer_visit2_noninfected.pdf',
+#       visit2_post_boost.plot, device = 'pdf', width = 5.3, height = 5)
+
+#write_tsv(visit2_post_boost.plot$data, 
+#          'results/antibodies/boxplot_abs_titer_visit2_noninfected_data.tsv')
+```
+

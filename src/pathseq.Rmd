@@ -1,0 +1,110 @@
+---
+title: "Microbiota analysis"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load libraries}
+library(phyloseq)
+library(tidyverse)
+library(microbiome)
+```
+
+```{r Load files}
+ds.ma <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+
+se.pathseq.rna <- ds.ma[['Pathseq.RNA']]
+se.pathseq.dna <- ds.ma[['Pathseq.DNA']]
+```
+
+```{r Prepare phyloseq object}
+## RNA
+# Taxonomy table
+TAX.rna = tax_table(as.matrix(rowData(se.pathseq.rna)))
+
+# OTU abundance
+OTU.rna = otu_table(assay(se.pathseq.rna), taxa_are_rows = TRUE)
+
+# Sample table
+SMPL.rna <- sample_data(as.data.frame(colData(se.pathseq.rna)))
+
+# Create phyloseq object
+physeq.species.rna = phyloseq(OTU.rna, TAX.rna, SMPL.rna)
+
+## DNA
+# Taxonomy table
+TAX.dna = tax_table(as.matrix(rowData(se.pathseq.dna)))
+
+# OTU abundance
+OTU.dna = otu_table(assay(se.pathseq.dna), taxa_are_rows = TRUE)
+
+# Sample table
+SMPL.dna <- sample_data(as.data.frame(colData(se.pathseq.dna)))
+
+# Create phyloseq object
+physeq.species.dna = phyloseq(OTU.dna, TAX.dna, SMPL.dna)
+```
+
+```{r RNA analysis}
+#### Composition plot with water control
+pseq <- physeq.species.rna %>% 
+  aggregate_rare(level="species", detection = 1, prevalence = 0.7)
+
+colors <- pals::glasbey(length(taxa_names(pseq)))
+names(colors) <- taxa_names(pseq)
+
+rna.compostion.plot <- plot_composition(pseq, sample.sort = 'ds', 
+                                        group_by = 'group',
+                                        otu.sort = 'abundance') +
+  scale_fill_manual('species', values = colors[top_taxa(pseq)]) +
+  theme(legend.position = "bottom") +
+  theme(axis.text.x = element_blank())
+
+#ggsave('results/pathseq/composition_plot_RNA_before_water_removal.pdf',
+#       rna.compostion.plot, scale = 0.75)
+
+pseq <- physeq.species.rna %>% 
+  microbiome::transform(transform = "compositional") %>% 
+  aggregate_rare(level="species", detection = 0, prevalence = 0.5)
+
+colors <- pals::glasbey(length(taxa_names(pseq)))
+names(colors) <- taxa_names(pseq)
+
+plot_composition(pseq, sample.sort = 'ds', group_by = 'group',
+                 otu.sort = 'abundance') +
+  scale_fill_manual('species', values = colors[top_taxa(pseq)]) +
+  theme(legend.position = "bottom")
+
+#### Subtract water control
+# Species
+physeq.species.rna.samples <- physeq.species.rna %>% 
+  subset_samples(group == "experimentalGroup")
+
+physeq.species.rna.control <- physeq.species.rna %>% 
+  subset_samples(group == "WaterControl")
+
+#nc.mean <- rowMeans(physeq.species.rna.control@otu_table)
+
+z <- physeq.species.rna.samples@otu_table -  as.vector(physeq.species.rna.control@otu_table[,2])
+
+new.otu <- z %>% 
+  as.data.frame() %>% 
+  mutate(across(everything(), ~ifelse(. < 0, 0, .)))
+
+physeq.species.rna@otu_table <- otu_table(new.otu, taxa_are_rows = TRUE)
+
+pseq <- physeq.species.rna %>% 
+  microbiome::transform(transform = "compositional") %>% 
+  aggregate_rare(level="species", detection = 0, prevalence = 0.25)
+
+colors <- pals::glasbey(length(taxa_names(pseq)))
+names(colors) <- taxa_names(pseq)
+
+plot_composition(pseq, sample.sort = 'ds', group_by = 'group',
+                 otu.sort = 'abundance') +
+  scale_fill_manual('species', values = colors[top_taxa(pseq)]) +
+  theme(legend.position = "bottom")
+
+
+```
+

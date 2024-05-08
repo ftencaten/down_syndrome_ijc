@@ -1,0 +1,270 @@
+---
+title: "Metabolomic Training"
+author: "ten-Caten, Felipe - ftencat@emory.edu"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Libraries}
+library(tidyverse)
+library(recipes)
+library(ggfortify)
+library(limma)
+library(pheatmap)
+library(pvca)
+library(fgsea)
+library(clusterProfiler)
+library(ggridges)
+library(ggrepel)
+```
+
+```{r Load files}
+ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+
+pheno <- as.data.frame(colData(ds.mae))
+
+metab.se <- ds.mae[['Metabolites']] 
+```
+
+```{r EDA}
+# remove rows (metabolites) with more than 50% missing data
+metab.counts <- assay(metab.se)[rowMeans(is.na(assay(metab.se))) < 0.5, ]
+
+metab.counts.ds <- merge(as.data.frame(colData(metab.se)[, 11, drop = F]), 
+                         t(metab.counts), by = 'row.names')
+
+metab.imputed <- 
+  recipe(GROUP_ID ~ ., data = metab.counts.ds) %>%
+  update_role(`Row.names`, new_role = "id variable") %>% 
+  step_impute_knn(all_numeric()) %>% 
+  prep()  %>% 
+  bake(new_dat = metab.counts.ds) %>% 
+  relocate(GROUP_ID)
+
+### PCA ----
+library(ggfortify)
+pca.metab <- autoplot(prcomp(log(metab.imputed[,-c(1:2)]), scale. = T), 
+         data = metab.imputed[, 1:2], fill = 'GROUP_ID', size = 3, shape = 21) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"),
+                    name = 'Group', labels = c('HC', 'DS')) +
+  theme_bw()
+
+#ggsave('results/metabolites/figures/PCA_metab_visit2.pdf', pca.metab,
+#       scale = 0.5, device = 'pdf')
+
+### PVCA ----
+metadata <- colData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid') %>% 
+  mutate(patientid = sub('\r\n.*', '', CLIENT_SAMPLE_ID)) %>% 
+  left_join(colData(ds.mae) %>% 
+              as.data.frame() %>% 
+              rownames_to_column('patientid')) %>% 
+  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, sex) %>% 
+  mutate(height_meter = ifelse(height_meter > 100, height_meter/100, height_meter)) %>% 
+  mutate(bmi =  weight_kg/height_meter^2) %>% 
+  mutate(bmi = ifelse(bmi == 0, NA, bmi)) %>% 
+  mutate(bmi = ifelse(bmi == Inf, NA, bmi)) %>% 
+  mutate(bmi_category = case_when(bmi < 18.5 ~ 'underweight',
+                                  bmi >= 18.5 & bmi < 25 ~ 'healthy',
+                                  bmi >= 25 & bmi < 30 ~ 'overweight',
+                                  bmi >= 30 ~ 'obesity',
+                                  TRUE ~ NA_character_)) %>% 
+  mutate(age_category = case_when(age_years < 30 ~ 'under_30',
+                                  TRUE ~ 'over_30')) %>% 
+  column_to_rownames('sampleid') %>% 
+  select(ds, age_category, bmi_category, sex)
+
+metab.imputed.matrix <- metab.imputed[,-1] %>% 
+  column_to_rownames('Row.names') %>% 
+  t() %>% 
+  as.matrix()
+
+eset <- ExpressionSet(assayData = metab.imputed.matrix[,rownames(metadata)], 
+                      phenoData = AnnotatedDataFrame(metadata))
+
+batch.factors <- c('ds', 'age_category', 'bmi_category', 'sex')
+
+pvca <- pvcaBatchAssess(eset, batch.factors = batch.factors, threshold = 0.1)
+
+df <- data.frame("Prop_var" = pvca$dat[1,], "condition" = pvca$label) %>%
+          arrange(desc(Prop_var))
+
+pvca.metabolites <- ggplot(df, aes(x = reorder(condition,Prop_var), 
+                                   y = Prop_var)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Condition",
+         y = "Proportion of variance explained") +
+    theme_bw() +
+    coord_flip()
+
+#ggsave('results/metabolites/figures/PVCA_metabolites.pdf', pvca.metabolites,
+#       device = 'pdf', scale = 0.4)
+```
+
+```{r Linear Model - limma}
+pheno <- colData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('sampleid') %>% 
+  mutate(patientid = sub('\r\n.*', '', CLIENT_SAMPLE_ID)) %>% 
+  left_join(colData(ds.mae) %>% 
+              as.data.frame() %>% 
+              rownames_to_column('patientid')) %>% 
+  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, sex) %>% 
+  mutate(height_meter = ifelse(height_meter > 100, height_meter/100, height_meter)) %>% 
+  mutate(bmi =  weight_kg/height_meter^2) %>% 
+  mutate(bmi = ifelse(bmi == 0, NA, bmi)) %>% 
+  mutate(bmi = ifelse(bmi == Inf, NA, bmi)) %>% 
+  column_to_rownames('sampleid') %>% 
+  mutate(age_scaled = scale(age_years)[,1])
+
+designMat <- model.matrix(~ ds + age_scaled + sex, data = pheno)
+
+fit1 <- lmFit(metab.counts[,rownames(pheno)], design = designMat)
+fit2 <- eBayes(fit1)
+top.ds <- topTable(fit2, coef=2, n = Inf, sort.by="none")
+
+summary(decideTests(fit2))
+
+top.ds.annot <- merge(as.data.frame(rowData(metab.se)), top.ds, by = 'row.names') %>% 
+  column_to_rownames('Row.names') %>% 
+  arrange(P.Value)
+
+signif.metabs <- top.ds.annot %>% 
+  filter(adj.P.Val < 0.05)
+
+#write_tsv(signif.metabs, 'results/metabolites/signif_metabolites.tsv')
+
+#### Heatmap with signif metabolites ----
+metab.annot <- rowData(metab.se) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('metabid') %>% 
+  select(metabid,CHEMICAL_NAME)
+
+signif.metabs.df <- as.data.frame(assay(metab.se))[rownames(signif.metabs), rownames(pheno)] %>% 
+  rownames_to_column('metabid') %>% 
+  left_join(metab.annot) %>% 
+  mutate(CHEMICAL_NAME = sub('\\*', '', CHEMICAL_NAME)) %>% 
+  column_to_rownames('CHEMICAL_NAME') %>% 
+  select(-metabid) 
+
+ds.col <- c("#0D0887FF", "#F0F921FF")
+names(ds.col) <- c('HC', 'DS')
+
+annot.col <- list(Group = ds.col)
+
+pheno <- pheno %>% arrange(ds) %>% 
+  dplyr::rename(Group = ds, Sex = sex, 'Age (years)' = age_years) %>% 
+  mutate(Group = ifelse(Group == 'no', 'HC', 'DS'))
+
+pheatmap(log2(signif.metabs.df[,rownames(pheno)]), 
+         scale = 'row', annotation_col = pheno[,c(2), drop = F],
+         show_rownames = F, show_colnames = F, annotation_colors = annot.col,
+         color = colorRampPalette(c('darkblue', 'blue', 'white', 
+                                    'red', 'darkred'))(100), 
+         cluster_cols = F, cellwidth = 3, cellheight = 2)
+
+#### Enrichment analysis ----
+gene_set <- gmtPathways("data/metabolomics/smpdb_collection_metabolic_transformed.gmt")
+
+#metabolon_gene_set <- gene_set[grepl('METABOLON', names(gene_set))]
+metabolon_gene_set <- gene_set
+
+term2gene <- stack(metabolon_gene_set) %>% 
+  dplyr::rename(term = ind, gene = values) %>% 
+  relocate(term, gene) %>% 
+  mutate(term = sub('METABOLON_', '', term))
+
+up.top.ds <- top.ds.annot %>% filter(adj.P.Val < 0.05, logFC > 0)
+down.top.ds <- top.ds.annot %>% filter(adj.P.Val < 0.05, logFC < 0)
+
+metabolon.ora.metab.pos <- enricher(rownames(up.top.ds),
+                           TERM2GENE = term2gene, minGSSize = 2,
+                           pvalueCutoff = 0.1)
+
+metabolomic.pos.dotplot <- dotplot(metabolon.ora.metab.pos,
+                                   x = 'p.adjust', decreasing = F) +
+  scale_x_continuous(trans = 'reverse') +
+  geom_vline(xintercept = 0.05, linetype= 2, color = 'red') +
+  labs(x = 'p-value adjusted (BH)',  title = 'DS - Upregulated pathways')
+
+ggsave('results/metabolites/figures/dotplot_upregulated_pathways.pdf', 
+       metabolomic.pos.dotplot, device = 'pdf', scale = 0.55)
+
+metabolon.ora.metab.neg <- enricher(rownames(down.top.ds),
+                           TERM2GENE = term2gene, minGSSize = 2,
+                           pvalueCutoff = 0.1)
+
+metabolomic.neg.dotplot <- dotplot(metabolon.ora.metab.neg,
+                                   x = 'p.adjust', decreasing = F) +
+  scale_x_continuous(trans = 'reverse') +
+  geom_vline(xintercept = 0.05, linetype= 2, color = 'red') +
+  labs(x = 'p-value adjusted (BH)', title = 'DS - Downregulated pathways') 
+
+ggsave('results/metabolites/figures/dotplot_downregulated_pathways.pdf', 
+       metabolomic.neg.dotplot, device = 'pdf', scale = 0.55)
+
+#### Ridge plot ----
+ridgeplot_metab <- signif.metabs %>% 
+  filter(!(grepl('^X-', CHEMICAL_NAME))) %>% 
+  filter(SUB_PATHWAY != 'Partially Characterized Molecules') %>% 
+  group_by(SUB_PATHWAY) %>% 
+  filter(n() >= 3) %>% 
+  ungroup() %>% 
+  arrange(desc(SUPER_PATHWAY)) %>%
+  mutate(SUB_PATHWAY = factor(SUB_PATHWAY, 
+                              levels = unique(SUB_PATHWAY))) %>% 
+  ggplot(aes(x = sign(logFC), y = SUB_PATHWAY)) +
+  geom_density_ridges(aes(fill = SUPER_PATHWAY)) +
+  scale_fill_manual(values = RColorBrewer::brewer.pal(8, 'Set2')) +
+  theme(panel.background = element_blank()) +
+  labs(y = '')
+
+#ggsave('results/metabolites/figures/ridge_plot_metabolic_Pathways.pdf',
+#       ridgeplot_metab, device = pdf, width = 6.5, height = 6)
+
+#### Volcano Plot ----
+signif.up <- top.ds.annot %>% 
+  filter(adj.P.Val < 0.05, logFC > 0) %>% 
+  rownames_to_column('CHEM_ID') %>% 
+  group_by(SUB_PATHWAY) %>% 
+  arrange(desc(logFC), .by_group = T) %>% 
+  column_to_rownames('CHEM_ID')
+
+signif.down <- top.ds.annot %>% 
+  filter(adj.P.Val < 0.05, logFC < 0) %>% 
+  rownames_to_column('CHEM_ID') %>% 
+  group_by(SUB_PATHWAY) %>% 
+  arrange(desc(logFC), .by_group = T) %>% 
+  column_to_rownames('CHEM_ID')
+
+signif.names <- top.ds.annot %>% 
+  filter(CHEMICAL_NAME %in% c('kynurenine', 'valerate (5:0)', 
+                              'trimethylamine N-oxide', 'tryptophan', 'serotonin',
+                              '7-ketodeoxycholate', '3beta-hydroxy-5-cholenoate'))
+
+volcano.metabs <- top.ds.annot %>% 
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(alpha = 0.5) +
+  geom_point(data = signif.up, color = "red", size = 2) +
+  geom_point(data = signif.down, color = "blue", size = 2) +
+  geom_label_repel(data = signif.names, 
+                   aes(label = PLOT_NAME),  
+                   min.segment.length = 0, size = 3, box.padding = 0.5) + 
+  geom_hline(yintercept = -log10(0.05), linetype = 2) +
+  geom_segment(aes(x = 2, y = 9, xend = 4, yend = 9),
+                  arrow = arrow(length = unit(0.5, "cm"))) +
+  annotate("label", label = "Down Syndrome", 
+           x = 3, y = 10, size = 3, colour = "black") +
+  geom_segment(aes(x = -2, y = 9, xend = -4, yend = 9),
+                  arrow = arrow(length = unit(0.5, "cm"))) +
+  annotate("label", label = "Healthy Control", 
+           x = -3, y = 10, size = 3, colour = "black") +
+  scale_x_continuous(limits = c(-5.2,5.2))+
+  theme_bw() +
+  theme(axis.text = element_text(size = 10), 
+        axis.title = element_text(size = 10))
+
+#ggsave('results/metabolites/figures/volcano_plot.pdf', volcano.metabs,
+#       device = 'pdf', scale = 0.5)
+```
