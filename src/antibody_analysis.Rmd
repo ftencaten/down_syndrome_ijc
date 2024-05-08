@@ -10,6 +10,7 @@ library(rstatix)
 library(ggpubr)
 library(MultiAssayExperiment)
 library(ggfortify)
+library(limma)
 ```
 
 ```{r Load files}
@@ -24,6 +25,11 @@ abs.raw <- ds.mae[['Antibodies']]
 ```
 
 ```{r Pre-processing}
+sfun <- function(x) { 
+  x <- na.omit(x)
+  if (all(x>=0)) NA else max(x[x<0]) 
+}
+
 abs.df <- t(abs.raw) %>% 
   as.data.frame() %>% 
   rownames_to_column('sampleid') %>% 
@@ -33,18 +39,84 @@ abs.pheno <- abs.df %>%
   mutate(patientid = sub('_.*', '', sampleid))  |> 
   left_join(pheno %>% 
               rownames_to_column('patientid') %>% 
-              select(patientid, ds, age_years, sex, most_recent_event, number_events)) |> 
-  mutate(visit = sub('.*_','',  sampleid))
+              select(patientid, ds, age_years, sex, Visit.1.date, Visit.2.date, 
+                     starts_with('X'))) |> 
+  mutate(visit = sub('.*_','',  sampleid)) |> 
+  relocate(sampleid, visit) |> 
+  mutate(Visit.date = case_when(visit == 'V1' ~ `Visit.1.date`, 
+                                TRUE ~ `Visit.2.date`)) |> 
+  select(-c(`Visit.1.date`, `Visit.2.date`)) |> 
+  mutate(`interval_visit_1st_infec_days` = time_length(interval(Visit.date, 
+                                                    X1st.infection.date), unit = 'days'),
+         `interval_visit_2nd_infec_days` = time_length(interval(Visit.date, 
+                                                    X2nd.infection.date), unit = 'days'),
+         `interval_visit_from_1st_vacc_days` = time_length(interval(Visit.date, 
+                                                    X1st.vacc..dose.date), unit = 'days'),
+         `interval_visit_from_2nd_vacc_days` = time_length(interval(Visit.date, 
+                                                    X2nd.vacc..dose.date), unit = 'days'),
+         `interval_visit_from_3rd_vacc_days` = time_length(interval(Visit.date, 
+                                                    X3rd.vacc..dose.date), unit = 'days'),
+         `interval_visit_from_4th_vacc_days` = time_length(interval(Visit.date, 
+                                                    X4th.vacc..dose.date), unit = 'days'),
+         `interval_visit_from_5th_vacc_days` = time_length(interval(Visit.date, 
+                                                    X5th.vacc..dose.date), unit = 'days')) |> 
+  rowwise() %>%
+  mutate(most_recent_event = sfun(c_across(ends_with('c_days'))),
+         number_events = sum(c_across(ends_with('c_days')) < 0, na.rm = T)) %>%
+  ungroup() 
 ```
 
 ```{r Exploratory PCA}
-autoplot(prcomp(log1p(abs.pheno[,2:9])), data = abs.pheno, shape = 21,
-         fill = 'visit', size = 3)
+pca.visit <- autoplot(prcomp(log1p(abs.pheno[,2:9])), 
+                      data = abs.pheno, shape = 21,
+                      fill = 'visit', size = 3)
 
-autoplot(prcomp(log1p(abs.pheno[,2:9])), data = abs.pheno, shape = 21,
-         fill = 'ds', size = 3) +
+#ggsave('results/antibodies/pca_visit.pdf', pca.visit, width = 5.5, height = 5)
+
+pca.ds <-autoplot(prcomp(log1p(abs.pheno[,2:9])), 
+                  data = abs.pheno, shape = 21, fill = 'ds', size = 3) +
   scale_fill_manual(values= c('darkblue', 'yellow'))
+
+#ggsave('results/antibodies/pca_downsyndrome.pdf', pca.ds, width = 5.5, height = 5)
 ```
+
+```{r Linear regression - limma}
+### Visit 1
+abs.pheno.v1 <- abs.pheno |> 
+  filter(visit == 'V1') |> 
+  column_to_rownames('sampleid') |> 
+  filter(!is.na(most_recent_event), !is.na(number_events))
+
+ds <- abs.pheno.v1$ds
+antigen_exposure_days <- abs(abs.pheno.v1$most_recent_event)
+number_exposures <- abs.pheno.v1$number_events
+
+design <- model.matrix(~ ds + antigen_exposure_days )
+
+fit <- lmFit( t(log1p(abs.pheno.v1[,2:9])), design=design)
+fit <- eBayes(fit)
+
+topTable(fit, coef = 'dsyes')
+
+## Visit 2
+abs.pheno.v2 <- abs.pheno |> 
+  filter(visit == 'V2')|> 
+  column_to_rownames('sampleid') |> 
+  filter(!is.na(most_recent_event), !is.na(number_events))
+
+ds <- abs.pheno.v2$ds
+antigen_exposure_days <- abs(abs.pheno.v2$most_recent_event)
+number_exposures <- abs.pheno.v2$number_events
+
+design <- model.matrix(~ ds + antigen_exposure_days +number_exposures)
+
+fit <- lmFit( t(log1p(abs.pheno.v2[,2:9])), design=design)
+fit <- eBayes(fit)
+
+topTable(fit, coef = 'dsyes')
+```
+
+
 
 ```{r Initial Plots}
 pheno.days %>% 
