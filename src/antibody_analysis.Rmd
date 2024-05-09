@@ -63,17 +63,18 @@ abs.pheno <- abs.df %>%
   rowwise() %>%
   mutate(most_recent_event = sfun(c_across(ends_with('c_days'))),
          number_events = sum(c_across(ends_with('c_days')) < 0, na.rm = T)) %>%
-  ungroup() 
+  ungroup() |> 
+  mutate(infection = ifelse(is.na(X1st.infection.date), 'no', 'yes')) 
 ```
 
 ```{r Exploratory PCA}
-pca.visit <- autoplot(prcomp(log1p(abs.pheno[,2:9])), 
+pca.visit <- autoplot(prcomp(log1p(abs.pheno[,3:10])), 
                       data = abs.pheno, shape = 21,
                       fill = 'visit', size = 3)
 
 #ggsave('results/antibodies/pca_visit.pdf', pca.visit, width = 5.5, height = 5)
 
-pca.ds <-autoplot(prcomp(log1p(abs.pheno[,2:9])), 
+pca.ds <-autoplot(prcomp(log1p(abs.pheno[,3:10])), 
                   data = abs.pheno, shape = 21, fill = 'ds', size = 3) +
   scale_fill_manual(values= c('darkblue', 'yellow'))
 
@@ -81,7 +82,7 @@ pca.ds <-autoplot(prcomp(log1p(abs.pheno[,2:9])),
 ```
 
 ```{r Linear regression - limma}
-### Visit 1
+### VISIT 1
 abs.pheno.v1 <- abs.pheno |> 
   filter(visit == 'V1') |> 
   column_to_rownames('sampleid') |> 
@@ -91,16 +92,33 @@ ds <- abs.pheno.v1$ds
 antigen_exposure_days <- abs(abs.pheno.v1$most_recent_event)
 number_exposures <- abs.pheno.v1$number_events
 
-design <- model.matrix(~ ds + antigen_exposure_days )
+design <- model.matrix(~ ds + antigen_exposure_days)
 
 fit <- lmFit( t(log1p(abs.pheno.v1[,2:9])), design=design)
 fit <- eBayes(fit)
 
 topTable(fit, coef = 'dsyes')
 
-## Visit 2
+# Filter by days + # antigen exposure + no infection
+abs.pheno.v1 <- abs.pheno |> 
+  filter(visit == 'V1', most_recent_event >= -90, 
+         infection == 'no', number_events == 2) |> 
+  column_to_rownames('sampleid') |> 
+  filter(!is.na(most_recent_event), !is.na(number_events))
+
+ds <- abs.pheno.v1$ds
+
+design <- model.matrix(~ ds )
+
+fit <- lmFit( t(log1p(abs.pheno.v1[,2:9])), design=design)
+fit <- eBayes(fit)
+
+abs.v1.stat <- topTable(fit, coef = 'dsyes')
+
+## VISIT 2
 abs.pheno.v2 <- abs.pheno |> 
-  filter(visit == 'V2')|> 
+  filter(visit == 'V2', most_recent_event >= -90, 
+         infection == 'no', number_events == 3) |> 
   column_to_rownames('sampleid') |> 
   filter(!is.na(most_recent_event), !is.na(number_events))
 
@@ -108,13 +126,153 @@ ds <- abs.pheno.v2$ds
 antigen_exposure_days <- abs(abs.pheno.v2$most_recent_event)
 number_exposures <- abs.pheno.v2$number_events
 
-design <- model.matrix(~ ds + antigen_exposure_days +number_exposures)
+design <- model.matrix(~ ds + antigen_exposure_days)
 
 fit <- lmFit( t(log1p(abs.pheno.v2[,2:9])), design=design)
 fit <- eBayes(fit)
 
 topTable(fit, coef = 'dsyes')
+
+# Filter by days + # antigen exposure + no infection
+abs.pheno.v2 <- abs.pheno |> 
+  filter(visit == 'V2', most_recent_event >= -90, 
+         infection == 'no', number_events == 3) |> 
+  column_to_rownames('sampleid') |> 
+  filter(!is.na(most_recent_event), !is.na(number_events))
+
+ds <- abs.pheno.v2$ds
+
+design <- model.matrix(~ ds )
+
+fit <- lmFit( t(log1p(abs.pheno.v2[,2:9])), design=design)
+fit <- eBayes(fit)
+
+abs.v2.stat <- topTable(fit, coef = 'dsyes')
 ```
+
+```{r Plots}
+density.days <- abs.pheno |> 
+  ggplot(aes(x = abs(most_recent_event), fill = ds)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = c('darkblue', 'yellow'), name = 'Group',
+                    labels = c('non-DS', 'DS')) +
+  xlim(c(0,400))+
+  facet_wrap(~visit) +
+  labs(x = 'Days from antigen exposure') +
+  theme(axis.title = element_text(size = 13),
+        axis.text = element_text(size = 11))
+
+#ggsave('results/antibodies/densityplot_days_antigens_exposure.pdf',
+#       density.days, scale = 0.5)
+
+abs.tidy <- abs.pheno |> 
+  mutate(infection = ifelse(is.na(X1st.infection.date), 'no', 'yes')) |> 
+  select(sampleid, visit, starts_with('SARS'), starts_with('Spike'),
+         ds, age_years, sex, infection, most_recent_event, number_events) |> 
+  pivot_longer(-c(sampleid, visit, ds, age_years, sex, infection, 
+                  most_recent_event, number_events), 
+               names_to = 'antibody', values_to = 'titer')
+
+abs.v1 <- abs.tidy |> 
+  filter(visit == 'V1') |> 
+  ggplot(aes(x = ds, y = titer, fill = ds))+
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, ) +
+  geom_jitter(shape = 21, width = 0.05) +
+  facet_wrap(~antibody, scales = 'free_y') +
+  scale_y_continuous(transform = 'log10') +
+  scale_fill_manual(values = c('darkblue', 'yellow'), guide = 'none') +
+  scale_x_discrete(labels = c('non-DS', 'DS')) +
+  labs(x = '') +
+  ggtitle('Visit 1')
+
+#ggsave('results/antibodies/boxplot_v1_titers.pdf', abs.v1, width = 7, height = 7)
+
+
+abs.v2 <- abs.tidy |> 
+  filter(visit == 'V2') |> 
+  ggplot(aes(x = ds, y = titer, fill = ds))+
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, ) +
+  geom_jitter(shape = 21, width = 0.05) +
+  facet_wrap(~antibody, scales = 'free_y') +
+  scale_y_continuous(transform = 'log10') +
+  scale_fill_manual(values = c('darkblue', 'yellow'), guide = 'none') +
+  scale_x_discrete(labels = c('non-DS', 'DS')) +
+  labs(x = '') +
+  ggtitle('Visit 2')
+
+#ggsave('results/antibodies/boxplot_v2_titers.pdf', abs.v2, width = 7, height = 7)
+
+nucleocapsid.v1.v2 <- abs.tidy |> 
+  filter(antibody == 'SARS-CoV2 Nucleocapsid') |> 
+  ggplot(aes(x = visit, y = titer, fill = ds))+
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, ) +
+  geom_point(shape = 21, 
+             position = position_jitterdodge(jitter.width = 0.05)) +
+  scale_y_continuous(transform = 'log10') +
+  geom_smooth(method = 'lm', aes(group = ds, colour = ds), se = F, size = 2) +
+  scale_fill_manual(values = c('darkblue', 'yellow'), name = 'Group',
+                    labels = c('non-DS', 'DS')) +
+  scale_colour_manual(values = c('darkblue', '#CCCC00'), name = 'Group',
+                    labels = c('non-DS', 'DS')) +
+  labs(x = '') +
+  ggtitle('SARS-CoV2 Nucleocapsid')
+
+#ggsave('results/antibodies/boxplot_v1_v2_nucleocapsid_titers.pdf', 
+#       nucleocapsid.v1.v2, width = 6.66, height = 4)
+
+## Filter 90 days + No infection + # Exposures
+abs.v1.stat.p <- abs.v1.stat |> 
+  rownames_to_column('antibody') |> 
+  mutate(group1 = 'no', group2 = 'yes', y.position = 5.7) |> 
+  mutate(P.Value = round(P.Value, digits = 3)) |> 
+  dplyr::rename(p = P.Value) |> 
+  select(antibody, group1, group2, y.position, p)
+
+abs.v1.d90  <- abs.tidy |> 
+  filter(visit == 'V1', most_recent_event >= -90, 
+         infection == 'no', number_events == 2) |> 
+  ggplot(aes(x = ds, y = titer))+
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, aes(fill = ds)) +
+  geom_jitter(shape = 21, width = 0.05, aes(fill = ds)) +
+  facet_wrap(~antibody, scales = 'free_y') +
+  stat_pvalue_manual(abs.v1.stat.p) +
+  scale_y_continuous(transform = 'log10',
+                     expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c('darkblue', 'yellow'), guide = 'none') +
+  scale_x_discrete(labels = c('non-DS', 'DS')) +
+  labs(x = '') +
+  ggtitle('Visit 1 - Antigen exposure up to 90 days + 2 vaccines + No infection')
+
+#ggsave('results/antibodies/boxplot_v1_titers_90days_noinfection_2vacc.pdf', 
+#       abs.v1.d90, width = 7, height = 7)
+
+abs.v2.stat.p <- abs.v2.stat |> 
+  rownames_to_column('antibody') |> 
+  mutate(group1 = 'no', group2 = 'yes', y.position = 6.5) |> 
+  mutate(P.Value = round(P.Value, digits = 3)) |> 
+  dplyr::rename(p = P.Value) |> 
+  select(antibody, group1, group2, y.position, p)
+
+abs.v2.d90  <- abs.tidy |> 
+  filter(visit == 'V2', most_recent_event >= -90, 
+         infection == 'no', number_events == 3) |>
+  ggplot(aes(x = ds, y = titer))+
+  geom_boxplot(outlier.shape = NA, alpha = 0.7,  aes( fill = ds)) +
+  geom_jitter(shape = 21, width = 0.05, aes( fill = ds)) +
+  facet_wrap(~antibody, scales = 'free_y') +
+  scale_y_continuous(transform = 'log10',
+                     expand = expansion(mult = c(0.05, 0.15))) +
+  stat_pvalue_manual(abs.v2.stat.p) +
+  scale_fill_manual(values = c('darkblue', 'yellow'), guide = 'none') +
+  scale_x_discrete(labels = c('non-DS', 'DS')) +
+  labs(x = '') +
+  ggtitle('Visit 2 - Antigen exposure up to 90 days + 3 vaccines + No infection')
+
+ggsave('results/antibodies/boxplot_v2_titers_90days_noinfection_3vacc.pdf', 
+       abs.v2.d90, width = 7, height = 7)
+```
+
+
 
 
 
