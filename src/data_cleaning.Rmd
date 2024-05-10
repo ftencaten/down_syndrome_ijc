@@ -1,7 +1,9 @@
 ---
 title: "Data cleaning"
+author: "ten-Caten, Felipe - ftencat@emory.edu"
 editor_options: 
   chunk_output_type: console
+output: github_document
 ---
 
 ```{r Libraries}
