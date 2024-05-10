@@ -83,7 +83,7 @@ pca.ds <-autoplot(prcomp(log1p(abs.pheno[,3:10])),
 #ggsave('results/antibodies/pca_downsyndrome.pdf', pca.ds, width = 5.5, height = 5)
 ```
 
-```{r Linear regression - limma}
+```{r Linear regression - DS}
 ### VISIT 1
 abs.pheno.v1 <- abs.pheno |> 
   filter(visit == 'V1') |> 
@@ -175,6 +175,15 @@ abs.tidy <- abs.pheno |>
                   most_recent_event, number_events), 
                names_to = 'antibody', values_to = 'titer')
 
+
+sub.v2 <- abs.tidy |> 
+  filter(visit == 'V2', most_recent_event >= -90, 
+         infection == 'no', number_events == 3) |> 
+  select(-c(antibody, titer)) |> 
+  unique()
+
+#write_tsv(sub.v2, 'results/antibodies/selected_patients_visit2_40.tsv')
+
 abs.v1 <- abs.tidy |> 
   filter(visit == 'V1') |> 
   ggplot(aes(x = ds, y = titer, fill = ds))+
@@ -211,7 +220,7 @@ nucleocapsid.v1.v2 <- abs.tidy |>
   geom_point(shape = 21, 
              position = position_jitterdodge(jitter.width = 0.05)) +
   scale_y_continuous(transform = 'log10') +
-  geom_smooth(method = 'lm', aes(group = ds, colour = ds), se = F, size = 2) +
+  geom_smooth(method = 'lm', aes(group = ds, colour = ds), se = F, linewidth = 2) +
   scale_fill_manual(values = c('darkblue', 'yellow'), name = 'Group',
                     labels = c('non-DS', 'DS')) +
   scale_colour_manual(values = c('darkblue', '#CCCC00'), name = 'Group',
@@ -257,7 +266,7 @@ abs.v2.stat.p <- abs.v2.stat |>
 
 abs.v2.d90  <- abs.tidy |> 
   filter(visit == 'V2', most_recent_event >= -90, 
-         infection == 'no', number_events == 3) |>
+         infection == 'no', number_events == 3) 
   ggplot(aes(x = ds, y = titer))+
   geom_boxplot(outlier.shape = NA, alpha = 0.7,  aes( fill = ds)) +
   geom_jitter(shape = 21, width = 0.05, aes( fill = ds)) +
@@ -270,13 +279,19 @@ abs.v2.d90  <- abs.tidy |>
   labs(x = '') +
   ggtitle('Visit 2 - Antigen exposure up to 90 days + 3 vaccines + No infection')
 
-ggsave('results/antibodies/boxplot_v2_titers_90days_noinfection_3vacc.pdf', 
-       abs.v2.d90, width = 7, height = 7)
+#ggsave('results/antibodies/boxplot_v2_titers_90days_noinfection_3vacc.pdf', 
+#       abs.v2.d90, width = 7, height = 7)
+```
+
+```{r Linear regression - ABs (Spike)}
+metab.raw <- ds.mae[['Metabolites']] 
+
+sub.metab <- metab.raw[]
 ```
 
 
 
-
+### Old analysis
 
 ```{r Initial Plots}
 pheno.days %>% 
