@@ -282,7 +282,7 @@ abs.v2.d90  <- abs.tidy |>
 #       abs.v2.d90, width = 7, height = 7)
 ```
 
-```{r Linear regression - ABs (Spike)}
+```{r Linear regression - ABs (Spike) vs Metabolites}
 sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_40.tsv')
 
 metab.raw <- ds.mae[['Metabolites']] 
@@ -293,17 +293,16 @@ metabs.to.keep <- which(rowMeans(is.na(assay(sub.metab))) <= 1/3)
 
 sub.metab.v2 <- sub.metab[names(metabs.to.keep),]
 
-sub.v2.sorted <- sub.v2 |> 
-  column_to_rownames('sampleid')
+sub.v2.log <- sub.v2 |> 
+  column_to_rownames('sampleid') |> 
+  mutate(across(8:15, ~log1p(.)))
 
-spike <- log2(sub.v2.sorted[colnames(sub.metab.v2), 'SARS-CoV2 Spike'])
-
-design <- model.matrix(~ spike)
+design <- model.matrix(~ ds, data = sub.v2.log)
 
 fit <- lmFit(assay(sub.metab.v2), design=design)
 fit <- eBayes(fit)
 
-out <- topTable(fit, coef = 'spike', sort.by = 'p', n=Inf)
+out <- topTable(fit, coef = 2, sort.by = 'p', n=Inf)
 
 out.name <- out |> 
   rownames_to_column('metabid') |> 
@@ -331,6 +330,50 @@ ora.metab.down <- enricher(rownames(down.out),
                           pvalueCutoff =  Inf, qvalueCutoff = Inf,
                           universe = rownames(assay(sub.metab.v2)))
 
+## Correlation
+cor.ab.metab <- t(assay(sub.metab.v2)) |> 
+  as.data.frame() |> 
+  rownames_to_column('sampleid') |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`)) |> 
+  cor_test(vars = 'SARS-CoV2 Spike', method = 'spearman') |> 
+  adjust_pvalue(p.col = 'p', method = 'BH') |> 
+  arrange(p) |> 
+  left_join(as.data.frame(rowData(metab.raw)) |> 
+              rownames_to_column('var2') |>
+              select(var2, PLOT_NAME, SUPER_PATHWAY, SUB_PATHWAY))
+```
+
+```{r Linear regression - ABs (Spike) vs Cytokines}
+sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_40.tsv')
+
+cytokines.raw <- ds.mae[['MSD.plasma']] 
+
+sub.cytok <- cytokines.raw[,sub.v2$sampleid]
+ 
+sub.v2.log <- sub.v2 |> 
+  column_to_rownames('sampleid') |> 
+  mutate(across(8:15, ~log1p(.)))
+  
+design <- model.matrix(~`SARS-CoV2 Spike`, data = sub.v2.log)
+
+fit <- lmFit(log1p(sub.cytok), design = design)
+fit <- eBayes(fit)
+
+summary(decideTests(fit))
+
+out.cytok <- topTable(fit, coef = 2, sort.by = 'p', n=Inf)
+
+## Correlation
+cor.ab.cytok <- t(sub.cytok) |> 
+  as.data.frame() |> 
+  rownames_to_column('sampleid') |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`, `SARS-CoV2 S1-RBD`, 
+                             `SARS-CoV2 Nucleocapsid`)) |> 
+  rstatix::cor_test(vars = contains('SARS'), vars2 = 2:44, method = 'spearman')
+  
+```
+
+```{r Linear regression - ABs (Spike) vs RNA-seq}
 
 ```
 
