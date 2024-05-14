@@ -650,6 +650,60 @@ hallmark.gsva.stat <- hallmark.gsva %>%
            method = 'spearman')
 ```
 
+```{r Differential expression - Antibody subset}
+sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_40.tsv') |> 
+  mutate(patientid = sub('_V2', '', sampleid))
+
+count.matrix <- assay(se) |>   
+  as.data.frame()
+
+pheno <- as.data.frame(colData(se)) %>% 
+  mutate(ds = factor(ds, levels = c('no', 'yes'))) %>% 
+  mutate(age_scaled = scale(age_years)[,1])
+
+dds <- DESeqDataSetFromMatrix(countData = count.matrix,
+                              colData = pheno,
+                              rowData = as.data.frame(rowData(se)),
+                              design = ~ ds + age_scaled)
+
+pheno.sub <- pheno |> 
+  filter(patient %in% sub.v2$patientid)
+
+sub.dds <- dds[,rownames(pheno.sub)]
+
+keep <- rowSums(counts(sub.dds) >= 5) >= 5
+sub.dds <- sub.dds[keep,]
+
+sub.dds <- DESeq(sub.dds)
+resultsNames(sub.dds)
+
+ds.degs <- results(sub.dds, name = 'ds_yes_vs_no', tidy=TRUE) |>  
+  left_join(as.data.frame(rowData(sub.dds)) |> 
+                            rownames_to_column('row') |> 
+                            dplyr::select(row, hgnc_symbol)) |> 
+  arrange(pvalue)
+
+#### GSEA
+### Enrichment analysis
+library(clusterProfiler)
+
+# Gene sets
+h.gene_set <- msigdbr::msigdbr(category = 'H') %>% 
+  dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+## create gene ranks
+ds.rank <- ds.degs %>% 
+  mutate(rank = -log10(pvalue)*sign(log2FoldChange)) %>% 
+  arrange(desc(rank)) %>% 
+  dplyr::select(hgnc_symbol, rank) %>% 
+  deframe()
+
+gsea.result <- GSEA(ds.rank, TERM2GENE = h.gene_set, eps = 0)
+```
+
+
+
 ```{r Differential expression - Age by group and sex}
 library(cluster)
 
