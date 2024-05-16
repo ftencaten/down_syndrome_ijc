@@ -12,7 +12,9 @@ library(pvca)
 ```
 
 ```{r Load files}
-ds.ma <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
+ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay_20240507.rds')
+
+flow.se <- ds.mae[['Flow.cytometry']]
 ```
 
 ```{r pvca function}
@@ -192,6 +194,10 @@ pheatmap::pheatmap(flow.df[top.features,], scale = 'row',
                                               'red', 'darkred'))(100),
                    show_colnames = F, annotation_col = metadata,
                    annotation_colors = annotCol)
+
+```
+
+```{r}
 
 ```
 
