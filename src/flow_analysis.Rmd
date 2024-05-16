@@ -15,6 +15,8 @@ library(pvca)
 ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay_20240507.rds')
 
 flow.se <- ds.mae[['Flow.cytometry']]
+
+subset.patients <- read_tsv('results/antibodies/selected_patients_visit2_56.tsv')
 ```
 
 ```{r pvca function}
@@ -198,6 +200,42 @@ pheatmap::pheatmap(flow.df[top.features,], scale = 'row',
 ```
 
 ```{r}
+flow.df <- assay(flow.se, 'Unstimulated') %>% 
+  as.data.frame() %>%  
+  select(all_of(subset.patients$sampleid))  %>% 
+  filter(rowMeans(. < 0, na.rm = T) < 0.1) %>%  # remove flow gates with more 10% negative values (compensation problem)
+  #log1p() %>% 
+  filter(rowMeans(is.na(.)) < 1/3) %>%  # remove flow gates with more 1/3 NA
+  as.matrix()
 
+pheno <- subset.patients |> 
+  column_to_rownames('sampleid') |> 
+  mutate(most_recent_event = abs(most_recent_event))
+
+design <- model.matrix(~ ds + age_years + sex + most_recent_event, data = pheno)
+
+fit <- lmFit(log1p(flow.df), design = design)
+fit <- eBayes(fit)
+
+summary(decideTests(fit))
+
+out <- topTable(fit, coef = 'dsyes', sort.by = 'p', n = Inf) |> 
+  rownames_to_column('flow_feature')
+
+#write_tsv(out, 'results/flow_cytometry/linear_regression_DS_56patients.tsv')
+
+## Spearman correlation
+flow.antibody.df <- t(flow.df) |> 
+  as.data.frame() |> 
+  rownames_to_column('sampleid') |> 
+  left_join(subset.samples |> select('sampleid', 'SARS-CoV2 Spike'))
+
+cor_flow_antibody <- flow.antibody.df |> 
+  cor_test(vars = 'SARS-CoV2 Spike', method = 'spearman') |> 
+  adjust_pvalue(p.col = 'p', method = 'BH') |> 
+  arrange(p)
+
+#write_tsv(cor_flow_antibody, 
+#          'results/flow_cytometry/spearman_correl_SpikeABs_Flow_56patients.tsv')
 ```
 
