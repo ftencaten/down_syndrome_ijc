@@ -16,6 +16,88 @@ library(ggfortify)
 library(limma)
 ```
 
+```{r pvca function}
+#https://github.com/dleelab/pvca
+
+PVCA <- function(counts, meta, threshold, inter){
+
+  counts.center <- t(apply(counts, 1, scale, center=TRUE, scale=FALSE))
+  cor.counts <- cor(counts.center)
+  dim(cor.counts)
+  eigen.counts <- eigen(cor.counts)
+  eigen.mat <- eigen.counts$vectors
+  eigen.val <- eigen.counts$values
+  n.eigen <- length(eigen.val)
+  eigen.val.sum <- sum(eigen.val)
+  percents.pcs <- eigen.val/eigen.val.sum
+  meta <- as.data.frame(meta)
+
+  all <- 0
+  npc.in <- 0
+  for(i in 1:n.eigen){
+    all <- all + percents.pcs[i]
+    npc.in <- npc.in + 1
+    if(all > threshold){break}
+  }
+  if (npc.in < 3) {npc <- 3}
+
+  pred.list <- colnames(meta)
+  meta <- droplevels(meta)
+
+  n.preds <- ncol(meta) + 1
+  if(inter) {n.preds <- n.preds + choose(ncol(meta),2)}
+
+  ran.pred.list <- c()
+  for(i in 1:ncol(meta)){
+    ran.pred.list <- c(ran.pred.list, paste0("(1|", pred.list[i],")"))
+  }
+  ##interactions
+  if(inter){
+    for(i in 1:(ncol(meta)-1)){
+      for(j in (i+1):ncol(meta)){
+        ran.pred.list <- c(ran.pred.list, paste0("(1|", pred.list[i], ":", pred.list[j], ")"))
+        pred.list <- c(pred.list, paste0(pred.list[i], ":", pred.list[j]))
+      }
+    }
+  }
+  formula <- paste(ran.pred.list, collapse = " + ")
+  formula <- paste("pc", formula, sep=" ~ ")
+  ran.var.mat <- NULL
+  for(i in 1:npc.in){
+    dat <- cbind(eigen.mat[,i],meta)
+    colnames(dat) <- c("pc",colnames(meta))
+    Rm1ML <- lme4::lmer(formula, dat, REML = TRUE, verbose = FALSE, na.action = na.omit)
+    var.vec <- unlist(VarCorr(Rm1ML))
+    ran.var.mat <- rbind(ran.var.mat, c(var.vec[pred.list], resid = sigma(Rm1ML)^2))
+  }
+  ran.var.mat.std <- ran.var.mat/rowSums(ran.var.mat)
+  wgt.vec <- eigen.val/eigen.val.sum
+  prop.var <- colSums(ran.var.mat.std*wgt.vec[1:npc.in])
+  std.prop.var <- prop.var/sum(prop.var)
+  std.prop.var
+}
+
+PlotPVCA <- function(pvca.res, title){
+  plot.dat <- data.frame(eff=names(pvca.res), prop=pvca.res)
+  p <- ggplot2::ggplot(plot.dat, aes(x=eff, y=prop))
+  p <- p + ggplot2::ggtitle(title)
+  p <- p + ggplot2::geom_bar(stat="identity", fill="steelblue", colour="steelblue")
+  p <- p + ggplot2::geom_text(aes(label=round(prop,3), y=prop+0.04), size=4)
+  p <- p + ggplot2::scale_x_discrete(limits=names(pvca.res))
+  p <- p + ggplot2::scale_y_continuous(limits = c(0,1))
+  p <- p + ggplot2::labs(x= "Effects", y= "Weighted average proportion variance")
+  p <- p + ggplot2::theme_bw()
+  p <- p + ggplot2::theme(plot.background = element_blank() ,panel.grid.major = element_blank(),
+                 panel.grid.minor = element_blank() ,panel.border = element_blank(), panel.background = element_blank())
+  p <- p + ggplot2::theme(axis.line = element_line(color = 'black'))
+  p <- p + ggplot2::theme(axis.title.x = element_text(size = 15, vjust=-0.5))
+  p <- p + ggplot2::theme(axis.title.y = element_text(size = 15, vjust= 1.0))
+  p <- p + ggplot2::theme(axis.text = element_text(size = 12))
+  p <- p + ggplot2::theme(axis.text.x = element_text(angle = 90, vjust= 0.5, hjust=1))
+  p
+}
+```
+
 ```{r Load files}
 #ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
 ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay_20240507.rds')
@@ -151,6 +233,35 @@ fit <- lmFit( t(log1p(abs.pheno.v2[,2:9])), design=design)
 fit <- eBayes(fit)
 
 abs.v2.stat <- topTable(fit, coef = 'dsyes')
+
+# Filter by # antigen exposure + no infection
+abs.pheno.v2 <- abs.pheno |> 
+  filter(visit == 'V2', infection == 'no', number_events == 3) |> 
+  column_to_rownames('sampleid') 
+
+# PVCA
+metadata <- abs.pheno.v2 |> 
+  mutate(age_category = cut(age_years, breaks = 4),
+         antigen_exposure_category = cut(abs(antigen_exposure), breaks = 4)) |>  
+  select(ds, sex, age_category, antigen_exposure_category)
+
+pvca <- PVCA(t(log1p(abs.pheno.v2[,2:9])), 
+             meta = metadata, threshold = 10, inter = F)
+
+PlotPVCA(pvca, title = 'PVCA - Antibodies')
+
+# Linear regression
+ds <- abs.pheno.v2$ds
+antigen_exposure <- abs(abs.pheno.v2$most_recent_event)
+age <- abs.pheno.v2$age_years
+sex <- abs.pheno.v2$sex
+
+design <- model.matrix(~ ds + antigen_exposure + age + sex)
+
+fit <- lmFit( t(log1p(abs.pheno.v2[,2:9])), design=design)
+fit <- eBayes(fit)
+
+abs.v2.stat <- topTable(fit, coef = 'dsyes')
 ```
 
 ```{r Plots}
@@ -197,7 +308,6 @@ abs.v1 <- abs.tidy |>
   ggtitle('Visit 1')
 
 #ggsave('results/antibodies/boxplot_v1_titers.pdf', abs.v1, width = 7, height = 7)
-
 
 abs.v2 <- abs.tidy |> 
   filter(visit == 'V2') |> 
@@ -266,7 +376,7 @@ abs.v2.stat.p <- abs.v2.stat |>
 
 abs.v2.d90  <- abs.tidy |> 
   filter(visit == 'V2', most_recent_event >= -90, 
-         infection == 'no', number_events == 3) 
+         infection == 'no', number_events == 3) |>  
   ggplot(aes(x = ds, y = titer))+
   geom_boxplot(outlier.shape = NA, alpha = 0.7,  aes( fill = ds)) +
   geom_jitter(shape = 21, width = 0.05, aes( fill = ds)) +
@@ -281,6 +391,37 @@ abs.v2.d90  <- abs.tidy |>
 
 #ggsave('results/antibodies/boxplot_v2_titers_90days_noinfection_3vacc.pdf', 
 #       abs.v2.d90, width = 7, height = 7)
+
+#### 3 vaccines + No infection
+abs.v2.stat.p <- abs.v2.stat |> 
+  rownames_to_column('antibody') |> 
+  mutate(group1 = 'no', group2 = 'yes', y.position = 6.5) |> 
+  mutate(P.Value = round(P.Value, digits = 4)) |> 
+  dplyr::rename(p = P.Value) |> 
+  select(antibody, group1, group2, y.position, p)
+
+abs.v2.noinfection  <- abs.tidy |> 
+  filter(visit == 'V2', infection == 'no', number_events == 3) |>  
+  ggplot(aes(x = ds, y = titer))+
+  geom_boxplot(outlier.shape = NA, alpha = 0.7,  aes( fill = ds)) +
+  geom_jitter(shape = 21, width = 0.05, aes( fill = ds)) +
+  facet_wrap(~antibody, scales = 'free_y') +
+  scale_y_continuous(transform = 'log10',
+                     expand = expansion(mult = c(0.05, 0.15))) +
+  stat_pvalue_manual(abs.v2.stat.p) +
+  scale_fill_manual(values = c('darkblue', 'yellow'), guide = 'none') +
+  scale_x_discrete(labels = c('non-DS', 'DS')) +
+  labs(x = '') +
+  ggtitle('Visit 2 - 3 vaccines + No infection')
+
+#ggsave('results/antibodies/boxplot_v2_titers_90days_noinfection_3vacc.pdf', 
+#       abs.v2.noinfection, width = 7, height = 7)
+
+sub.v2 <- abs.tidy |> 
+  filter(visit == 'V2', infection == 'no', number_events == 3) |> 
+  pivot_wider(names_from = 'antibody', values_from = 'titer')
+
+#write_tsv(sub.v2, 'results/antibodies/selected_patients_visit2_56.tsv')
 ```
 
 ```{r Linear regression - ABs (Spike) vs Metabolites}
