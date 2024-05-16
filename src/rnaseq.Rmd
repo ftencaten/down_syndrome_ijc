@@ -80,7 +80,89 @@ rnaseq.pvca <- ggplot(df, aes(x = reorder(condition,Prop_var), y = Prop_var)) +
 #       device = 'pdf', scale = 0.4)
 ```
   
-```{r Variance partition}
+```{r pvca function}
+#https://github.com/dleelab/pvca
+
+PVCA <- function(counts, meta, threshold, inter){
+
+  counts.center <- t(apply(counts, 1, scale, center=TRUE, scale=FALSE))
+  cor.counts <- cor(counts.center)
+  dim(cor.counts)
+  eigen.counts <- eigen(cor.counts)
+  eigen.mat <- eigen.counts$vectors
+  eigen.val <- eigen.counts$values
+  n.eigen <- length(eigen.val)
+  eigen.val.sum <- sum(eigen.val)
+  percents.pcs <- eigen.val/eigen.val.sum
+  meta <- as.data.frame(meta)
+
+  all <- 0
+  npc.in <- 0
+  for(i in 1:n.eigen){
+    all <- all + percents.pcs[i]
+    npc.in <- npc.in + 1
+    if(all > threshold){break}
+  }
+  if (npc.in < 3) {npc <- 3}
+
+  pred.list <- colnames(meta)
+  meta <- droplevels(meta)
+
+  n.preds <- ncol(meta) + 1
+  if(inter) {n.preds <- n.preds + choose(ncol(meta),2)}
+
+  ran.pred.list <- c()
+  for(i in 1:ncol(meta)){
+    ran.pred.list <- c(ran.pred.list, paste0("(1|", pred.list[i],")"))
+  }
+  ##interactions
+  if(inter){
+    for(i in 1:(ncol(meta)-1)){
+      for(j in (i+1):ncol(meta)){
+        ran.pred.list <- c(ran.pred.list, paste0("(1|", pred.list[i], ":", pred.list[j], ")"))
+        pred.list <- c(pred.list, paste0(pred.list[i], ":", pred.list[j]))
+      }
+    }
+  }
+  formula <- paste(ran.pred.list, collapse = " + ")
+  formula <- paste("pc", formula, sep=" ~ ")
+  ran.var.mat <- NULL
+  for(i in 1:npc.in){
+    dat <- cbind(eigen.mat[,i],meta)
+    colnames(dat) <- c("pc",colnames(meta))
+    Rm1ML <- lme4::lmer(formula, dat, REML = TRUE, verbose = FALSE, na.action = na.omit)
+    var.vec <- unlist(VarCorr(Rm1ML))
+    ran.var.mat <- rbind(ran.var.mat, c(var.vec[pred.list], resid = sigma(Rm1ML)^2))
+  }
+  ran.var.mat.std <- ran.var.mat/rowSums(ran.var.mat)
+  wgt.vec <- eigen.val/eigen.val.sum
+  prop.var <- colSums(ran.var.mat.std*wgt.vec[1:npc.in])
+  std.prop.var <- prop.var/sum(prop.var)
+  std.prop.var
+}
+
+PlotPVCA <- function(pvca.res, title){
+  plot.dat <- data.frame(eff=names(pvca.res), prop=pvca.res)
+  p <- ggplot2::ggplot(plot.dat, aes(x=eff, y=prop))
+  p <- p + ggplot2::ggtitle(title)
+  p <- p + ggplot2::geom_bar(stat="identity", fill="steelblue", colour="steelblue")
+  p <- p + ggplot2::geom_text(aes(label=round(prop,3), y=prop+0.04), size=4)
+  p <- p + ggplot2::scale_x_discrete(limits=names(pvca.res))
+  p <- p + ggplot2::scale_y_continuous(limits = c(0,1))
+  p <- p + ggplot2::labs(x= "Effects", y= "Weighted average proportion variance")
+  p <- p + ggplot2::theme_bw()
+  p <- p + ggplot2::theme(plot.background = element_blank() ,panel.grid.major = element_blank(),
+                 panel.grid.minor = element_blank() ,panel.border = element_blank(), panel.background = element_blank())
+  p <- p + ggplot2::theme(axis.line = element_line(color = 'black'))
+  p <- p + ggplot2::theme(axis.title.x = element_text(size = 15, vjust=-0.5))
+  p <- p + ggplot2::theme(axis.title.y = element_text(size = 15, vjust= 1.0))
+  p <- p + ggplot2::theme(axis.text = element_text(size = 12))
+  p <- p + ggplot2::theme(axis.text.x = element_text(angle = 90, vjust= 0.5, hjust=1))
+  p
+}
+```
+
+```{r Variance partition + PVCA}
 library(variancePartition)
 
 geneCounts <- assay(se) %>% 
@@ -129,7 +211,7 @@ variance.plot <- plotVarPart(vp)
 
 #ggsave('results/rnaseq/variance_explained_by_factor.pdf', variance.plot, scale = 0.5)
 
-### non-DS Control
+### non-DS Control ----
 gExpr.nonds <- gExpr[,gExpr$samples$ds == 'no',]
 
 gExpr.nonds <- calcNormFactors(gExpr.nonds)
@@ -151,7 +233,7 @@ nonds.variance.plot <- plotVarPart(vp.nonds)
 ggsave('results/rnaseq/variance_explained_by_factor_nonDS.pdf', 
        nonds.variance.plot, scale = 0.5)
 
-### individuals with DS
+### individuals with DS ----
 gExpr.ds <- gExpr[,gExpr$samples$ds == 'yes',]
 
 gExpr.ds <- calcNormFactors(gExpr.ds)
@@ -172,6 +254,38 @@ ds.variance.plot <- plotVarPart(vp.ds)
 
 #ggsave('results/rnaseq/variance_explained_by_factor_DS.pdf', 
 #       ds.variance.plot, scale = 0.5)
+
+### 40 individuals subsets (based on ABs analysis) ----
+gExpr.sub <- gExpr[,rownames(pheno.sub),]
+
+gExpr.sub <- calcNormFactors(gExpr.sub)
+
+design <- model.matrix(~sex, pheno.sub)
+
+vobjGenes.sub <- voom(gExpr.sub, design)
+
+# Define formula
+form <- ~  ds +  sex + age_years + most_recent_event
+
+varPart.sub <- fitExtractVarPartModel(vobjGenes.sub , form, pheno.sub)
+
+vp.sub <- sortCols(varPart.sub)
+
+sub.variance.plot <- plotVarPart(vp.sub) 
+
+#ggsave('results/rnaseq/variance_explained_by_factor_DS.pdf', 
+#       ds.variance.plot, scale = 0.5)
+
+### PVCA ----
+metadata <- gExpr.sub$sample |> 
+  mutate(age_category = cut(age_years, breaks = 5),
+         bmi_category = cut(bmi, breaks = 2)) |>  
+  select(ds, sex, age_category, bmi_category)
+
+pvca <- PVCA(cpm(gExpr.sub$counts), meta = metadata, threshold = 0.01, inter = F)
+pvca.plot 
+PlotPVCA(pvca, title = 'PVCA - RNA-seq')
+
 ```
 
 ```{r Differential expression - DS vs HC}
@@ -650,60 +764,6 @@ hallmark.gsva.stat <- hallmark.gsva %>%
            method = 'spearman')
 ```
 
-```{r Differential expression - Antibody subset}
-sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_40.tsv') |> 
-  mutate(patientid = sub('_V2', '', sampleid))
-
-count.matrix <- assay(se) |>   
-  as.data.frame()
-
-pheno <- as.data.frame(colData(se)) %>% 
-  mutate(ds = factor(ds, levels = c('no', 'yes'))) %>% 
-  mutate(age_scaled = scale(age_years)[,1])
-
-dds <- DESeqDataSetFromMatrix(countData = count.matrix,
-                              colData = pheno,
-                              rowData = as.data.frame(rowData(se)),
-                              design = ~ ds + age_scaled)
-
-pheno.sub <- pheno |> 
-  filter(patient %in% sub.v2$patientid)
-
-sub.dds <- dds[,rownames(pheno.sub)]
-
-keep <- rowSums(counts(sub.dds) >= 5) >= 5
-sub.dds <- sub.dds[keep,]
-
-sub.dds <- DESeq(sub.dds)
-resultsNames(sub.dds)
-
-ds.degs <- results(sub.dds, name = 'ds_yes_vs_no', tidy=TRUE) |>  
-  left_join(as.data.frame(rowData(sub.dds)) |> 
-                            rownames_to_column('row') |> 
-                            dplyr::select(row, hgnc_symbol)) |> 
-  arrange(pvalue)
-
-#### GSEA
-### Enrichment analysis
-library(clusterProfiler)
-
-# Gene sets
-h.gene_set <- msigdbr::msigdbr(category = 'H') %>% 
-  dplyr::select(gs_name, gene_symbol) |> 
-  unique()
-
-## create gene ranks
-ds.rank <- ds.degs %>% 
-  mutate(rank = -log10(pvalue)*sign(log2FoldChange)) %>% 
-  arrange(desc(rank)) %>% 
-  dplyr::select(hgnc_symbol, rank) %>% 
-  deframe()
-
-gsea.result <- GSEA(ds.rank, TERM2GENE = h.gene_set, eps = 0)
-```
-
-
-
 ```{r Differential expression - Age by group and sex}
 library(cluster)
 
@@ -1168,6 +1228,114 @@ col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "d
 ComplexHeatmap::Heatmap(ds.mat, name = 'CPM\nz-score', cluster_columns = F, show_row_names = F, 
                         show_column_names = F, top_annotation = column_ha, 
                         column_title = "DS individuals", col = col_fun)
+```
+
+```{r Differential expression - Antibody subset}
+sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_40.tsv') |> 
+  mutate(patientid = sub('_V2', '', sampleid))
+
+count.matrix <- assay(se) |>   
+  as.data.frame()
+
+pheno <- as.data.frame(colData(se)) %>% 
+  mutate(ds = factor(ds, levels = c('no', 'yes'))) %>% 
+  mutate(age_scaled = scale(age_years)[,1])
+
+dds <- DESeqDataSetFromMatrix(countData = count.matrix,
+                              colData = pheno,
+                              rowData = as.data.frame(rowData(se)),
+                              design = ~ ds + age_scaled)
+
+pheno.sub <- pheno |> 
+  filter(patient %in% sub.v2$patientid)
+
+sub.dds <- dds[,rownames(pheno.sub)]
+
+keep <- rowSums(counts(sub.dds) >= 5) >= 5
+sub.dds <- sub.dds[keep,]
+
+sub.dds <- DESeq(sub.dds)
+resultsNames(sub.dds)
+
+ds.degs <- results(sub.dds, name = 'ds_yes_vs_no', tidy=TRUE) |>  
+  left_join(as.data.frame(rowData(sub.dds)) |> 
+                            rownames_to_column('row') |> 
+                            dplyr::select(row, hgnc_symbol)) |> 
+  arrange(pvalue)
+
+#### GSEA
+### Enrichment analysis
+library(clusterProfiler)
+
+# Gene sets
+h.gene_set <- msigdbr::msigdbr(category = 'H') %>% 
+  dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+c2.gene_set <- msigdbr::msigdbr(category = 'C2') |> 
+  filter(grepl('CP:', gs_subcat)) |> 
+  dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+## create gene ranks
+ds.rank <- ds.degs %>% 
+  mutate(rank = -log10(pvalue)*sign(log2FoldChange)) %>% 
+  arrange(desc(rank)) %>% 
+  dplyr::select(hgnc_symbol, rank) %>% 
+  deframe()
+
+gsea.result <- GSEA(ds.rank, TERM2GENE = c2.gene_set, eps = 0)
+
+dotplot(gsea.result, label_format = 50, x= 'NES')
+
+#### Spike linear regression
+pheno.sub.spike <- pheno.sub  |> 
+  rownames_to_column('sampleid') |> 
+  dplyr::rename(patientid = patient) |> 
+  left_join(sub.v2 |> 
+              dplyr::select(patientid, `SARS-CoV2 Spike`)) |> 
+  mutate(spike_scaled = scale(log(`SARS-CoV2 Spike`))[,1]) |> 
+  column_to_rownames('sampleid')
+
+spike.dds <- DESeqDataSetFromMatrix(countData = count.matrix[,rownames(pheno.sub.spike)],
+                              colData = pheno.sub.spike,
+                              rowData = as.data.frame(rowData(se)),
+                              design = ~ spike_scaled)
+
+keep <- rowSums(counts(spike.dds) >= 5) >= 5
+spike.dds <- spike.dds[keep,]
+
+spike.dds <- DESeq(spike.dds)
+resultsNames(spike.dds)
+
+spike.degs <- results(spike.dds, name = 'spike_scaled', tidy=TRUE) |>  
+  left_join(as.data.frame(rowData(sub.dds)) |> 
+                            rownames_to_column('row') |> 
+                            dplyr::select(row, hgnc_symbol)) |> 
+  arrange(pvalue)
+
+### Correlation DS DEGs vs Spike
+top.var.genes <- names(sort(apply(cpm(spike.dds), 1, var), decreasing = T)[1:5000])
+
+top.var.cpm <- cpm(spike.dds)[top.var.genes,]
+
+top.var.cpm.spike <- t(top.var.cpm) |> 
+  as.data.frame() |> 
+  rownames_to_column('sampleid') |> 
+  left_join(pheno.sub.spike |> 
+              rownames_to_column('sampleid') |> 
+              dplyr::select(sampleid, `SARS-CoV2 Spike`))
+
+gene.spike.cor <- top.var.cpm.spike |> 
+  cor_test(vars = `SARS-CoV2 Spike`, method = 'spearman') |> 
+  adjust_pvalue(p.col = 'p') |> 
+  left_join(as.data.frame(rowData(se)) |> rownames_to_column('var2'))
+
+pos.cor <- gene.spike.cor |> filter(p < 0.05, cor > 0) |> select(hgnc_symbol) |> deframe()
+neg.cor <- gene.spike.cor |> filter(p < 0.05, cor < 0) |> select(hgnc_symbol) |> deframe()
+
+ora.pos <- enricher(pos.cor, TERM2GENE = h.gene_set)
+ora.neg <- enricher(neg.cor, TERM2GENE = h.gene_set)
 ```
 
 ```{r Moanin}
