@@ -1,0 +1,121 @@
+---
+title: "R Notebook"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load libraries}
+library(MultiAssayExperiment)
+library(tidyverse)
+library(rstatix)
+```
+
+```{r Load files}
+ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay_20240507.rds')
+
+sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_56.tsv')
+```
+
+```{r Pre-processing}
+cytokines.raw <- ds.mae[['MSD.plasma']] |> 
+  as.data.frame() |> 
+  select(ends_with('_V2')) |> 
+  rename_with(~sub('_V2', '', .))
+
+pheno <- as.data.frame(colData(ds.mae)) |> 
+  filter(!is.na(ds))
+```
+
+
+```{r PCA}
+# Whole dataset
+pca_plasma_visit2 <- prcomp(t(log1p(cytokines.raw)), scale. = T)
+
+pca_plot_plasma_visit2 <- autoplot(pca_plasma_visit2, 
+         data = pheno[colnames(cytokines.raw),], fill = 'ds', 
+         shape = 21, size = 3, names = T, alpha = 0.8) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines - Visit 2')+
+  theme_bw()
+
+ggsave('results/cytokines/figures/pca_plasma_cytokines_Visit2.pdf',
+       pca_plot_plasma_visit2, device = 'pdf', scale = 0.5)
+
+## identify outliers
+mt::pca.outlier(t(log1p(cytokines.raw)))
+
+#  56 patients subset
+cytokines.raw.subset <- cytokines.raw[, sub('_V2', '', sub.v2$sampleid)]
+
+pca_plasma_visit2 <- prcomp(t(log1p(cytokines.raw.subset)), scale. = T)
+
+pca_plot_plasma_visit2.subset <- autoplot(pca_plasma_visit2, 
+         data = pheno[colnames(cytokines.raw.subset),], fill = 'ds', 
+         shape = 21, size = 3, names = T, alpha = 0.8) +
+  scale_fill_manual(values = c("#0D0887FF", "#F0F921FF"), name = 'Group',
+                    labels = c('HC', 'DS')) +
+  ggtitle('PCA - Plasma Cytokines - Visit 2 - 56 patients')+
+  theme_bw()
+
+ggsave('results/cytokines/figures/pca_plasma_cytokines_Visit2_subset.pdf',
+       pca_plot_plasma_visit2.subset, device = 'pdf', scale = 0.5)
+
+## identify outliers subset
+mt::pca.outlier(t(log1p(cytokines.raw.subset)))
+```
+
+
+```{r Linear regression - DS}
+# prepare eset
+cytokines.raw <- ds.mae[['MSD.plasma']] |> 
+  as.data.frame() |> 
+  select(ends_with('_V2')) |> 
+  rename_with(~sub('_V2', '', .))
+
+pheno <- as.data.frame(colData(ds.mae)) |> 
+  filter(!is.na(ds)) |> 
+  mutate(most_recent_event = abs(most_recent_event))
+
+eset <- ExpressionSet(assayData = as.matrix(log1p(cytokines.raw[,rownames(pheno)])),
+                      phenoData = AnnotatedDataFrame(pheno))
+
+# Whole dataset
+design <- model.matrix(~ ds + age_years + sex + most_recent_event, data = pData(eset))
+
+fit <- lmFit(eset[,rownames(design)], design = design)
+fit <- eBayes(fit)
+
+summary(decideTests(fit))
+
+out <- topTable(fit, coef = 'dsyes', sort.by = 'p', n = Inf)
+
+## Subset 56 patients
+eset.subset <- eset[,sub('_V2', '', sub.v2$sampleid)]
+
+design <- model.matrix(~ ds + age_years + sex + most_recent_event, 
+                       data = pData(eset.subset))
+
+fit <- lmFit(eset.subset, design = design)
+fit <- eBayes(fit)
+
+summary(decideTests(fit))
+
+out <- topTable(fit, coef = 'dsyes', sort.by = 'p', n = Inf)
+
+#write_tsv(out, 'results/cytokines/linear_regression_cytokines_56patients_DS_vs_nonDS.tsv')
+```
+
+```{r Correlation - ABs (Spike) vs Cytokines}
+cor.ab.cytok <- ds.mae[['MSD.plasma']] |> 
+  t() |> 
+  as.data.frame() |> 
+  rownames_to_column('sampleid') |> 
+  right_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`)) |> 
+  rstatix::cor_test(vars = contains('SARS'), method = 'spearman') 
+
+write_tsv(cor.ab.cytok ,
+         'results/cytokines/spearman_correlation_cytokines_Spike_56patients_DS_vs_nonDS.tsv')
+```
+
+
