@@ -199,7 +199,7 @@ pheatmap::pheatmap(flow.df[top.features,], scale = 'row',
 
 ```
 
-```{r}
+```{r Linear regression - DS}
 flow.df <- assay(flow.se, 'Unstimulated') %>% 
   as.data.frame() %>%  
   select(all_of(subset.patients$sampleid))  %>% 
