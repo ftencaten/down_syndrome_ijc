@@ -454,6 +454,108 @@ dotplot(metabolon.ora.metab.pos,
 
 ```
 
+```{r Linear regression - Selected samples - ABs (Spike) vs Metabolites}
+sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_56.tsv')
+
+metab.raw <- ds.mae[['Metabolites']] 
+
+sub.metab <- metab.raw[,sub.v2$sampleid]
+
+metabs.to.keep <- which(rowMeans(is.na(assay(sub.metab))) <= 1/3)
+
+sub.metab.v2 <- sub.metab[names(metabs.to.keep),]
+
+pheno <- sub.v2 |> 
+  column_to_rownames('sampleid') |> 
+  mutate(most_recent_event = abs(most_recent_event)) 
+
+
+design <- model.matrix(~ ds + age_years + sex + most_recent_event, data = pheno)
+
+fit <- lmFit(assay(sub.metab.v2), design = design)
+fit <- eBayes(fit)
+
+summary(decideTests(fit))
+
+out <- topTable(fit, coef = 'dsyes', sort.by = 'p', n = Inf) |> 
+  rownames_to_column('metabid')
+
+out.name <- out |> 
+  left_join(as.data.frame(rowData(metab.raw)) |> 
+              rownames_to_column('metabid') |>
+              select(metabid, PLOT_NAME, SUPER_PATHWAY, SUB_PATHWAY))
+
+write_tsv(out.name, 'results/metabolites/DS_vs_HC_selected_samples_limma.tsv')
+
+x <-out.name |> 
+  filter(grepl('(bili|heme)', PLOT_NAME))
+
+write_clip(x)
+
+# Enrichment analysis
+gene_set <- gmtPathways("data/metabolomics/smpdb_collection_metabolic_transformed.gmt")
+
+term2gene <- stack(gene_set) %>% 
+  dplyr::rename(term = ind, gene = values) %>% 
+  relocate(term, gene)
+
+up.out <- out %>% filter(adj.P.Val < 0.05, logFC > 0)
+down.out <- out %>% filter(adj.P.Val < 0.05, logFC < 0)
+
+ora.metab.pos <- enricher(up.out$metabid,
+                          TERM2GENE = term2gene, 
+                          pvalueCutoff =  Inf, qvalueCutoff = Inf,
+                          universe = rownames(assay(sub.metab.v2)))
+
+ora.metab.down <- enricher(down.out$metabid,
+                          TERM2GENE = term2gene, 
+                          pvalueCutoff =  Inf, qvalueCutoff = Inf,
+                          universe = rownames(assay(sub.metab.v2)))
+
+rank <- out |> 
+  mutate(rank = -log10(P.Value)*sign(logFC)) |> 
+  arrange(desc(rank)) |> 
+  select(metabid, rank) |> 
+  deframe()
+
+gsea.metab <- GSEA(rank, TERM2GENE = term2gene, pvalueCutoff = Inf)
+
+enrichplot::re
+
+dotplot.gsea <- dotplot(gsea.metab, color = 'NES', x = 'pvalue', label_format = 70) +
+  scale_fill_viridis_c(option = 'H') +
+  scale_x_reverse() +
+  scale_y_discrete(limits = rev)
+
+ggsave('results/metabolites/figures/dotplot_gsea_upregulated_selected_sampled.pdf', 
+       dotplot.gsea, height = 4, width = 10)
+
+## Correlation
+cor.ab.metab <- t(assay(sub.metab.v2)) |> 
+  as.data.frame() |> 
+  rownames_to_column('sampleid') |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`)) |> 
+  cor_test(vars = 'SARS-CoV2 Spike', method = 'spearman') |> 
+  adjust_pvalue(p.col = 'p', method = 'BH') |> 
+  arrange(p) |> 
+  left_join(as.data.frame(rowData(metab.raw)) |> 
+              rownames_to_column('var2') |>
+              select(var2, PLOT_NAME, SUPER_PATHWAY, SUB_PATHWAY))
+
+up.out <- cor.ab.metab %>% filter(p < 0.05, cor > 0)
+down.out <- cor.ab.metab %>% filter(p < 0.05, cor < 0)
+
+ora.metab.pos <- enricher(up.out$var2,
+                          TERM2GENE = term2gene, 
+                          pvalueCutoff =  Inf, qvalueCutoff = Inf,
+                          universe = rownames(assay(sub.metab.v2)))
+
+ora.metab.down <- enricher(down.out$var2,
+                          TERM2GENE = term2gene, 
+                          pvalueCutoff =  Inf, qvalueCutoff = Inf,
+                          universe = rownames(assay(sub.metab.v2)))
+```
+
 ```{r Linear Model - limma - selected samples}
 pheno.days <- pheno %>% 
   mutate(visit_1_days = time_length(interval(visit_1_date, 
