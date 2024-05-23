@@ -1231,7 +1231,7 @@ ComplexHeatmap::Heatmap(ds.mat, name = 'CPM\nz-score', cluster_columns = F, show
 ```
 
 ```{r Differential expression - Antibody subset}
-sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_40.tsv') |> 
+sub.v2 <- read_tsv('results/antibodies/selected_patients_visit2_56.tsv') |> 
   mutate(patientid = sub('_V2', '', sampleid))
 
 count.matrix <- assay(se) |>   
@@ -1239,12 +1239,14 @@ count.matrix <- assay(se) |>
 
 pheno <- as.data.frame(colData(se)) %>% 
   mutate(ds = factor(ds, levels = c('no', 'yes'))) %>% 
-  mutate(age_scaled = scale(age_years)[,1])
+  mutate(age_scaled = scale(age_years)[,1]) |> 
+  mutate(most_recent_event = abs(most_recent_event)) |> 
+  filter(!is.na(most_recent_event))
 
-dds <- DESeqDataSetFromMatrix(countData = count.matrix,
+dds <- DESeqDataSetFromMatrix(countData = count.matrix[,rownames(pheno)],
                               colData = pheno,
                               rowData = as.data.frame(rowData(se)),
-                              design = ~ ds + age_scaled)
+                              design = ~ ds + age_years + sex + most_recent_event)
 
 pheno.sub <- pheno |> 
   filter(patient %in% sub.v2$patientid)
@@ -1268,13 +1270,19 @@ ds.degs <- results(sub.dds, name = 'ds_yes_vs_no', tidy=TRUE) |>
 library(clusterProfiler)
 
 # Gene sets
-h.gene_set <- msigdbr::msigdbr(category = 'H') %>% 
-  dplyr::select(gs_name, gene_symbol) |> 
-  unique()
-
 c2.gene_set <- msigdbr::msigdbr(category = 'C2') |> 
   filter(grepl('CP:', gs_subcat)) |> 
   dplyr::select(gs_name, gene_symbol) |> 
+  unique()
+
+btm <- readxl::read_xls('data/rna-seq/gene_signatures/btm_annotation_table.xls') %>% 
+  dplyr::select('Composite name', 'Module member genes') %>% 
+  separate_longer_delim('Module member genes', delim = ',') |> 
+  rename(gs_name = `Composite name`, gene_symbol = `Module member genes`)
+
+h.gene_set <- msigdbr::msigdbr(category = 'H') %>% 
+  dplyr::select(gs_name, gene_symbol) |> 
+  bind_rows(btm) |> 
   unique()
 
 ## create gene ranks
@@ -1284,9 +1292,156 @@ ds.rank <- ds.degs %>%
   dplyr::select(hgnc_symbol, rank) %>% 
   deframe()
 
-gsea.result <- GSEA(ds.rank, TERM2GENE = c2.gene_set, eps = 0)
+gsea.result <- GSEA(ds.rank, TERM2GENE = h.gene_set, eps = 0)
 
-dotplot(gsea.result, label_format = 50, x= 'NES')
+gsea.barplot <- gsea.result@result %>% 
+  slice_min(pvalue, n = 30) %>% 
+  arrange(NES) %>% 
+  mutate(ID = factor(ID, levels = ID)) %>% 
+  ggplot(aes(x = NES, y = ID, fill = NES)) +
+  geom_col() +
+  theme(axis.text.y = element_text(size = 10))+
+  scale_fill_viridis_c(option = 'H')+
+  ylab('') +
+  ggtitle('Top 30 pathwyas - DS')
+
+#ggsave('results/rnaseq/figures/gsea_btm_hallmark_top30_56patients_subset.pdf', 
+#       gsea.barplot, device = 'pdf', height = 5, width = 8)
+
+### GSVA enriched pathwways
+leading.edge.genes <- gsea.result@result %>% 
+  select(ID, core_enrichment) %>% 
+  separate_longer_delim(core_enrichment, delim = '/')
+
+leg.list <- split(leading.edge.genes$core_enrichment, leading.edge.genes$ID)
+
+cpm.dds <- cpm(sub.dds, log = T) |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(rowData(sub.dds) |> 
+              as.data.frame() |> 
+              rownames_to_column('ensemblid') |> 
+              select(ensemblid, hgnc_symbol)) |> 
+  distinct(hgnc_symbol, .keep_all = T) |> 
+  column_to_rownames('hgnc_symbol') |> 
+  select(-ensemblid) 
+
+gsvapar <- GSVA::gsvaParam(as.matrix(cpm.dds), leg.list, maxDiff=TRUE)
+
+gsva.ds <- GSVA::gsva(gsvapar)
+
+gsva.ds.out <- gsva.ds |>
+  as.data.frame() |> 
+  rownames_to_column('ID')
+
+#write_tsv(gsva.ds.out, 
+#          'results/rnaseq/gsva_enriched_pathways_56patients.tsv')
+
+gsva.spike.correl <- t(gsva.ds) |> 
+  as.data.frame() |> 
+  rownames_to_column('rowid') |> 
+  mutate(sampleid = paste0(sub('.*_', '', rowid), '_V2')) |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`)) |> 
+  select(-sampleid) |> 
+  cor_test(vars = `SARS-CoV2 Spike`, method = 'spearman') |> 
+  adjust_pvalue(p.col = 'p', method = 'BH') |> 
+  arrange(p)
+
+#write_tsv(gsva.spike.correl,
+#          'results/rnaseq/spearman_correlation_gsva_spike_56patients.tsv')
+
+### Heatmap
+spike.titer <- colData(sub.dds) |> 
+  as.data.frame() |> 
+  rownames_to_column('rowid') |> 
+  mutate(sampleid = paste0(sub('.*_', '', rowid), '_V2')) |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`)) |> 
+  mutate(`Log10 SARS-CoV2 Spike` = log10(`SARS-CoV2 Spike`)) |> 
+  arrange(`SARS-CoV2 Spike`)
+
+ds.vector <- ifelse(spike.titer$ds == 'no', 'non-DS', 'DS')
+
+col_fun = circlize::colorRamp2(seq(4, 6.5, length = 100), viridis::inferno(100, direction = -1))
+
+ha = HeatmapAnnotation(Group = ds.vector, 
+                       `SARS-CoV2 Spike` = spike.titer$`Log10 SARS-CoV2 Spike`,
+                       col = list(Group = c("DS" = "yellow", "non-DS" = "darkblue"),
+                                  `SARS-CoV2 Spike` = col_fun))
+
+Heatmap(name = 'z-score', gsva.ds[,spike.titer$rowid], show_column_names = F, 
+        row_names_gp = gpar(fontsize = 5),
+        top_annotation = ha, column_split = ds.vector)
+
+# no column clustering
+Heatmap(name = 'z-score', gsva.ds[,spike.titer$rowid], show_column_names = F, 
+        row_names_gp = gpar(fontsize = 5), cluster_columns = F,
+        top_annotation = ha, column_split = ds.vector)
+
+### GSVA all BTM and hallmark pathways
+hallmark.btm.list <- split(h.gene_set$gene_symbol, h.gene_set$gs_name)
+
+cpm.dds <- cpm(sub.dds, log = T) |> 
+  as.data.frame() |> 
+  rownames_to_column('ensemblid') |> 
+  left_join(rowData(sub.dds) |> 
+              as.data.frame() |> 
+              rownames_to_column('ensemblid') |> 
+              select(ensemblid, hgnc_symbol)) |> 
+  distinct(hgnc_symbol, .keep_all = T) |> 
+  column_to_rownames('hgnc_symbol') |> 
+  select(-ensemblid) 
+
+gsvapar.hallmark.btm <- GSVA::gsvaParam(as.matrix(cpm.dds), hallmark.btm.list)
+
+gsva.hallmark.btm.ds <- GSVA::gsva(gsvapar.hallmark.btm)
+
+gsva.hallmark.btm.ds.out <- gsva.hallmark.btm.ds |>
+  as.data.frame() |> 
+  rownames_to_column('ID')
+
+#write_tsv(gsva.hallmark.btm.ds.out, 
+#          'results/rnaseq/gsva_All_Hallmark_BTM_pathways_56patients.tsv')
+
+gsva.hallmark.btm.spike.correl <- t(gsva.hallmark.btm.ds) |> 
+  as.data.frame() |> 
+  rownames_to_column('rowid') |> 
+  mutate(sampleid = paste0(sub('.*_', '', rowid), '_V2')) |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`)) |> 
+  select(-sampleid) |> 
+  cor_test(vars = `SARS-CoV2 Spike`, method = 'spearman') |> 
+  adjust_pvalue(p.col = 'p', method = 'BH') |> 
+  arrange(p)
+
+#write_tsv(gsva.hallmark.btm.spike.correl,
+#          'results/rnaseq/spearman_correlation_gsva_All_Hallmark_BTM_pathways_spike_56patients.tsv')
+
+### Heatmap
+signif.pathways <- gsva.hallmark.btm.spike.correl |> 
+  filter(p <= 0.05) |> 
+  select(var2) |> 
+  deframe()
+
+spike.titer <- colData(sub.dds) |> 
+  as.data.frame() |> 
+  rownames_to_column('rowid') |> 
+  mutate(sampleid = paste0(sub('.*_', '', rowid), '_V2')) |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`)) |> 
+  mutate(`Log10 SARS-CoV2 Spike` = log10(`SARS-CoV2 Spike`)) |> 
+  arrange(`SARS-CoV2 Spike`)
+
+ds.vector <- ifelse(spike.titer$ds == 'no', 'non-DS', 'DS')
+
+col_fun = circlize::colorRamp2(seq(4, 6.5, length = 100), viridis::inferno(100, direction = -1))
+
+ha = HeatmapAnnotation(Group = ds.vector, 
+                       `SARS-CoV2 Spike` = spike.titer$`Log10 SARS-CoV2 Spike`,
+                       col = list(Group = c("DS" = "yellow", "non-DS" = "darkblue"),
+                                  `SARS-CoV2 Spike` = col_fun))
+
+Heatmap(name = 'z-score', gsva.hallmark.btm.ds[signif.pathways, spike.titer$rowid], 
+        show_column_names = F, row_names_gp = gpar(fontsize = 5), cluster_columns = F,
+        top_annotation = ha, row_split = 2)
+
 
 #### Spike linear regression
 pheno.sub.spike <- pheno.sub  |> 
