@@ -9,6 +9,8 @@ library(MultiAssayExperiment)
 library(tidyverse)
 library(ggfortify)
 library(pvca)
+library(limma)
+library(ComplexHeatmap)
 ```
 
 ```{r Load files}
@@ -223,6 +225,24 @@ out <- topTable(fit, coef = 'dsyes', sort.by = 'p', n = Inf) |>
   rownames_to_column('flow_feature')
 
 #write_tsv(out, 'results/flow_cytometry/linear_regression_DS_56patients.tsv')
+# Heatmap 
+signif.flow <- out |> 
+  as.data.frame() |> 
+  filter(adj.P.Val < 0.05) |> 
+  select(flow_feature) |> 
+  deframe()
+
+signif.flow.df <- t(scale(t(log1p(flow.df)[signif.flow,])))
+
+ds.vector <- ifelse(pheno$ds == 'no', 'non-DS', 'DS')
+
+ha = HeatmapAnnotation(Group = ds.vector, 
+                       col = list(Group = c("DS" = "yellow", "non-DS" = "darkblue")))
+
+Heatmap(signif.flow.df, name = 'z-score', show_column_names = F, 
+        top_annotation = ha, column_split = ds.vector, row_split = 2,
+        width = unit(6, "cm"), height = unit(25, "cm"), row_names_gp = gpar(fontsize = 4))
+
 
 ## Spearman correlation
 flow.antibody.df <- t(flow.df) |> 
