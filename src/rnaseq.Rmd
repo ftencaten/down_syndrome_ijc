@@ -13,6 +13,7 @@ library(limma)
 library(edgeR)
 library(circlize)
 library(clusterProfiler)
+library(ComplexHeatmap)
 ```
 
 ```{r Load files}
@@ -1265,6 +1266,9 @@ ds.degs <- results(sub.dds, name = 'ds_yes_vs_no', tidy=TRUE) |>
                             dplyr::select(row, hgnc_symbol)) |> 
   arrange(pvalue)
 
+#write_tsv(ds.degs, 
+#          'results/rnaseq/degs_DS_vs-nonDS_56patients.tsv')
+
 #### GSEA
 ### Enrichment analysis
 library(clusterProfiler)
@@ -1293,6 +1297,9 @@ ds.rank <- ds.degs %>%
   deframe()
 
 gsea.result <- GSEA(ds.rank, TERM2GENE = h.gene_set, eps = 0)
+
+write_tsv(gsea.result@result,
+          'results/rnaseq/gsea_pathway_enrichment_DS_vs-nonDS_Hallmark_BTM_56patients.tsv')
 
 gsea.barplot <- gsea.result@result %>% 
   slice_min(pvalue, n = 30) %>% 

@@ -99,7 +99,7 @@ PlotPVCA <- function(pvca.res, title){
 
 ```{r Load files}
 #ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay.rds')
-ds.mae <- readRDS('data/processed_multiassay_experiment/old/ds_ijc_multiassay_20230622.rds')
+ds.mae <- readRDS('data/processed_multiassay_experiment/ds_ijc_multiassay_20240507.rds')
 
 pheno <- as.data.frame(colData(ds.mae))
 
@@ -139,7 +139,8 @@ metadata <- colData(metab.se) %>%
   left_join(colData(ds.mae) %>% 
               as.data.frame() %>% 
               rownames_to_column('patientid')) %>% 
-  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, sex) %>% 
+  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, 
+         sex, most_recent_event) %>% 
   mutate(height_meter = ifelse(height_meter > 100, height_meter/100, height_meter)) %>% 
   mutate(bmi =  weight_kg/height_meter^2) %>% 
   mutate(bmi = ifelse(bmi == 0, NA, bmi)) %>% 
@@ -152,23 +153,27 @@ metadata <- colData(metab.se) %>%
   mutate(age_category = case_when(age_years < 30 ~ 'under_30',
                                   TRUE ~ 'over_30')) %>% 
   column_to_rownames('sampleid') %>% 
-  select(ds, age_category, bmi_category, sex)
+  mutate(antigen_exposure_category = case_when(abs(most_recent_event) <= 30 ~ '<30d',
+                                               abs(most_recent_event) > 30 &
+                                               abs(most_recent_event) <= 90  ~ '1-3m',
+                                               abs(most_recent_event) > 90  ~ '>3m')) |> 
+  select(ds, age_category, bmi_category, sex, antigen_exposure_category)
 
 metab.imputed.matrix <- metab.imputed[,-1] %>% 
   column_to_rownames('Row.names') %>% 
   t() %>% 
   as.matrix()
 
-pvca <- PVCA(metab.imputed.matrix, meta = metadata, threshold = 0.1, inter = F)
+pvca <- PVCA(log1p(metab.imputed.matrix), meta = metadata, threshold = 0.01, inter = F)
 pvca.plot <- PlotPVCA(pvca, title = 'PVCA - Metabolomics')
 
 eset <- ExpressionSet(assayData = metab.imputed.matrix[,rownames(metadata)], 
                       phenoData = AnnotatedDataFrame(metadata))
 
-batch.factors <- c('ds', 'age_category', 'bmi_category', 'sex')
+batch.factors <- c('ds', 'age_category', 'bmi_category', 
+                   'sex', 'antigen_exposure_category')
 
-pvca <- pvcaBatchAssess(eset, batch.factors = batch.factors, threshold = 0.1,
-                        interaction = F)
+pvca <- pvcaBatchAssess(eset, batch.factors = batch.factors, threshold = 0.1)
 
 df <- data.frame("Prop_var" = pvca$dat[1,], "condition" = pvca$label) %>%
           arrange(desc(Prop_var))
@@ -193,7 +198,7 @@ pheno <- colData(metab.se) %>%
   left_join(colData(ds.mae) %>% 
               as.data.frame() %>% 
               rownames_to_column('patientid')) %>% 
-  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, sex) %>% 
+  select(sampleid, patientid, ds, age_years, weight_kg, height_meter, sex, most_recent_event) %>% 
   mutate(height_meter = ifelse(height_meter > 100, height_meter/100, height_meter)) %>% 
   mutate(bmi =  weight_kg/height_meter^2) %>% 
   mutate(bmi = ifelse(bmi == 0, NA, bmi)) %>% 
@@ -201,13 +206,18 @@ pheno <- colData(metab.se) %>%
   column_to_rownames('sampleid') %>% 
   mutate(age_scaled = scale(age_years)[,1])
 
-designMat <- model.matrix(~ ds + age_scaled + sex, data = pheno)
+eset <- ExpressionSet(assayData = log1p(metab.counts),
+                      phenoData = AnnotatedDataFrame(pheno))
+  
+designMat <- model.matrix(~ ds + age_scaled + sex + abs(most_recent_event), 
+                          data = pData(eset))
 
-fit1 <- lmFit(metab.counts[,rownames(pheno)], design = designMat)
+fit1 <- lmFit(exprs(eset)[,rownames(designMat)], design = designMat)
 fit2 <- eBayes(fit1)
-top.ds <- topTable(fit2, coef=2, n = Inf, sort.by="none")
 
 summary(decideTests(fit2))
+
+top.ds <- topTable(fit2, coef='dsyes', n = Inf, sort.by="none")
 
 top.ds.annot <- merge(as.data.frame(rowData(metab.se)), top.ds, by = 'row.names') %>% 
   column_to_rownames('Row.names') %>% 
@@ -256,10 +266,7 @@ metabolon_gene_set <- gene_set
 
 term2gene <- stack(metabolon_gene_set) %>% 
   dplyr::rename(term = ind, gene = values) %>% 
-  relocate(term, gene) %>% 
-  mutate(term = sub('METABOLON_', '', term)) |> 
-  mutate(term = sub('SMPDB_', '', term)) |> 
-  mutate(term = gsub('_', ' ', term)) 
+  relocate(term, gene)
 
 ##GSEA
 rank.metab <- top.ds.annot |> 
@@ -269,7 +276,17 @@ rank.metab <- top.ds.annot |>
   select(compound_id, rank) |> 
   deframe() 
   
-gsea.metab <- GSEA(rank.metab, TERM2GENE = term2gene, pvalueCutoff = 0.1)  
+gsea.metab <- GSEA(rank.metab, TERM2GENE = term2gene, pvalueCutoff = Inf)  
+
+dotplot.gsea <- dotplot(gsea.metab |> filter(pvalue < 0.05), 
+        color = 'NES', x = 'pvalue', label_format = 70) +
+  scale_fill_viridis_c(option = 'H') +
+  scale_x_reverse() +
+  scale_y_discrete(limits = rev) +
+  ggtitle('DS vs non-DS - 120 individuals')
+
+#ggsave('results/metabolites/figures/dotplot_gsea_upregulated_All_samples.pdf', 
+#       dotplot.gsea, height = 3.5, width = 10)
 
 ## ORA
 up.top.ds <- top.ds.annot %>% filter(adj.P.Val < 0.05, logFC > 0)
@@ -485,7 +502,7 @@ out.name <- out |>
               rownames_to_column('metabid') |>
               select(metabid, PLOT_NAME, SUPER_PATHWAY, SUB_PATHWAY))
 
-write_tsv(out.name, 'results/metabolites/DS_vs_HC_selected_samples_limma.tsv')
+#write_tsv(out.name, 'results/metabolites/DS_vs_HC_selected_samples_limma.tsv')
 
 x <-out.name |> 
   filter(grepl('(bili|heme)', PLOT_NAME))
@@ -520,21 +537,43 @@ rank <- out |>
 
 gsea.metab <- GSEA(rank, TERM2GENE = term2gene, pvalueCutoff = Inf)
 
-enrichplot::re
-
 dotplot.gsea <- dotplot(gsea.metab, color = 'NES', x = 'pvalue', label_format = 70) +
   scale_fill_viridis_c(option = 'H') +
   scale_x_reverse() +
   scale_y_discrete(limits = rev)
 
-ggsave('results/metabolites/figures/dotplot_gsea_upregulated_selected_sampled.pdf', 
-       dotplot.gsea, height = 4, width = 10)
+#ggsave('results/metabolites/figures/dotplot_gsea_upregulated_selected_sampled.pdf', 
+#       dotplot.gsea, height = 4, width = 10)
+
+gsea.metab.result <- gsea.metab@result |> 
+  separate_longer_delim(core_enrichment, delim = '/') |> 
+  left_join(as.data.frame(rowData(metab.raw)) |> 
+              rownames_to_column('core_enrichment') |> 
+              select(core_enrichment, PLOT_NAME)) |> 
+  select(-core_enrichment) |> 
+  group_by(ID) %>%
+  summarize(core_enrichment_names = paste(PLOT_NAME, collapse = "/"))
+
+gsea.metab.result.names <- gsea.metab@result |> 
+  left_join(gsea.metab.result)
+
+#write_tsv(gsea.metab.result.names,
+#          'results/metabolites/gsea_leading_edge_metabolites_DS_vs_nonDS.tsv')
 
 ## Correlation
-cor.ab.metab <- t(assay(sub.metab.v2)) |> 
+# Only significant metabolites
+out.signif <- out.name |> 
+  filter(adj.P.Val < 0.1)  |> 
+  select(metabid) |> 
+  deframe()
+
+metab.ab.df <- t(assay(sub.metab.v2)) |> 
   as.data.frame() |> 
   rownames_to_column('sampleid') |> 
-  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`)) |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`))|> 
+  select(all_of(c('sampleid', 'SARS-CoV2 Spike', out.signif)))
+
+cor.metab.ab  <- metab.ab.df |> 
   cor_test(vars = 'SARS-CoV2 Spike', method = 'spearman') |> 
   adjust_pvalue(p.col = 'p', method = 'BH') |> 
   arrange(p) |> 
@@ -542,18 +581,115 @@ cor.ab.metab <- t(assay(sub.metab.v2)) |>
               rownames_to_column('var2') |>
               select(var2, PLOT_NAME, SUPER_PATHWAY, SUB_PATHWAY))
 
-up.out <- cor.ab.metab %>% filter(p < 0.05, cor > 0)
-down.out <- cor.ab.metab %>% filter(p < 0.05, cor < 0)
+write_tsv(cor.metab.ab, 
+          'results/metabolites/spearman_correlation_significant_metabolites_vs_Spike_56_samples.tsv')
+
+# All metabolites
+metab.ab.df <- t(assay(sub.metab.v2)) |> 
+  as.data.frame() |> 
+  rownames_to_column('sampleid') |> 
+  left_join(sub.v2 |> select(sampleid, `SARS-CoV2 Spike`))
+
+cor.metab.ab  <- metab.ab.df |> 
+  cor_test(vars = 'SARS-CoV2 Spike', method = 'spearman') |> 
+  adjust_pvalue(p.col = 'p', method = 'BH') |> 
+  arrange(p) |> 
+  left_join(as.data.frame(rowData(metab.raw)) |> 
+              rownames_to_column('var2') |>
+              select(var2, PLOT_NAME, SUPER_PATHWAY, SUB_PATHWAY))
+
+#write_tsv(cor.metab.ab, 
+#          'results/metabolites/spearman_correlation_All_metabolites_vs_Spike_56_samples.tsv')
+
+up.out <- cor.metab.ab %>% filter(p < 0.05, cor > 0)
+down.out <- cor.metab.ab %>% filter(p < 0.05, cor < 0)
 
 ora.metab.pos <- enricher(up.out$var2,
                           TERM2GENE = term2gene, 
                           pvalueCutoff =  Inf, qvalueCutoff = Inf,
                           universe = rownames(assay(sub.metab.v2)))
 
+ora.metab.pos.result <- ora.metab.pos@result |> 
+  left_join(as.data.frame(rowData(metab.raw)) |> 
+              rownames_to_column('geneID') |> 
+              select(geneID, PLOT_NAME)) 
+
+write_tsv(ora.metab.pos.result , 
+          'results/metabolites/ora_pathways_positive_correlation_spike.tsv')
+
 ora.metab.down <- enricher(down.out$var2,
                           TERM2GENE = term2gene, 
                           pvalueCutoff =  Inf, qvalueCutoff = Inf,
                           universe = rownames(assay(sub.metab.v2)))
+
+ora.metab.down.result <- ora.metab.down@result |> 
+  separate_longer_delim(geneID, delim = '/') |> 
+  left_join(as.data.frame(rowData(metab.raw)) |> 
+              rownames_to_column('geneID') |> 
+              select(geneID, PLOT_NAME)) |> 
+  select(-geneID) |> 
+  group_by(ID) %>%
+  summarize(geneID_names = paste(PLOT_NAME, collapse = "/"))
+
+ora.metab.down.result.names <- ora.metab.down@result |> 
+  left_join(ora.metab.down.result)
+
+write_tsv(ora.metab.down.result.names , 
+          'results/metabolites/ora_pathways_negative_correlation_spike.tsv')
+
+ora.down.cor <- dotplot(ora.metab.down,  x = 'pvalue', label_format = 70) +
+  scale_fill_continuous()+
+  scale_x_reverse() +
+  scale_y_discrete(limits = rev)
+
+ggsave('results/metabolites/figures/dotplot_ora_correlation_metabolites_spike.pdf',
+       ora.down.cor, scale = 0.5)
+
+signif.cor.metab.ab <- cor.metab.ab |> 
+  filter(p <= 0.05) |> 
+  select(var2) |> 
+  deframe()
+
+spike.titer <- sub.v2 |> 
+  mutate(`Log10 SARS-CoV2 Spike` = log10(`SARS-CoV2 Spike`)) |> 
+  arrange(`SARS-CoV2 Spike`)
+
+ds.vector <- ifelse(spike.titer$ds == 'no', 'non-DS', 'DS')
+
+col_fun = circlize::colorRamp2(seq(4, 6.5, length = 100), 
+                               viridis::inferno(100, direction = -1))
+
+ha = HeatmapAnnotation(Group = ds.vector, 
+                       `SARS-CoV2 Spike` = spike.titer$`Log10 SARS-CoV2 Spike`,
+                       col = list(Group = c("DS" = "yellow", "non-DS" = "darkblue"),
+                                  `SARS-CoV2 Spike` = col_fun))
+
+# select correlated features and sampleids following the sorted titer df
+signif.metab.df <- t(scale(t(log1p(assay(sub.metab.v2))[signif.cor.metab.ab, 
+                                                spike.titer$sampleid]))) |>
+  as.data.frame() |> 
+  rownames_to_column('metabid') |> 
+  left_join(as.data.frame(rowData(sub.metab.v2)) |> 
+              rownames_to_column('metabid') |>
+              dplyr::select(metabid, PLOT_NAME)) |> 
+  column_to_rownames('PLOT_NAME') |> 
+  dplyr::select(-metabid)
+  
+Heatmap(signif.metab.df, name = 'z-score', show_column_names = F, 
+        top_annotation = ha, row_split = 2, cluster_columns = F, 
+        row_names_gp = gpar(fontsize = 7),
+        width = unit(10, 'cm'), height = unit(10, 'cm'))
+
+## Intersection
+signif.cor.metab.ab <- cor.metab.ab |> 
+  filter(p <= 0.05)  
+
+intersec <- out.name |> 
+  filter(adj.P.Val < 0.05) |> 
+  inner_join(signif.cor.metab.ab, by = c('metabid' = 'var2'))
+
+write_tsv(intersec, 
+          'results/metabolites/intersection_linear_regression_DS_vs_non-DS_spearman_correlation.tsv')
 ```
 
 ```{r Linear Model - limma - selected samples}

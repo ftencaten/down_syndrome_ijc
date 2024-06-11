@@ -203,6 +203,168 @@ vacc.dates.plot <- vacc_dates %>%
         legend.title = element_text(size = 15))
 
 #ggsave('results/patients_timepoints_vaccination_update.pdf', vacc.dates.plot, scale = 0.9)
+
+vacc.dates.plot.clean <- vacc_dates %>% 
+  dplyr::select(Donor_ID, downsyndrome, starts_with('interval')) %>% 
+  arrange(downsyndrome, 
+          desc(interval_visit2_1st_infec_days),
+          desc(interval_visit2_from_1st_vacc_days),
+          desc(interval_visit2_from_2nd_vacc_days),
+          desc(interval_visit2_from_3rd_vacc_days)) %>% 
+  mutate(Donor_ID = factor(Donor_ID, levels = unique(Donor_ID))) %>% 
+  pivot_longer(-c(Donor_ID, downsyndrome), names_to = 'event', values_to = 'days', 
+               values_drop_na = T) %>% 
+  mutate(group = case_when(grepl('vacc', event) ~ 'Vaccination',
+                           event == 'interval_visit2_visit1_days' ~ 'Visit 1',
+                           event == 'interval_visit2_visit2_days' ~ 'Visit 2',
+                           grepl('infec', event) ~ 'Infecction')) %>% 
+  mutate(group = factor(group, levels = c('Visit 1', 'Visit 2', 'Vaccination', 
+                                          'Infecction'))) |> 
+  filter(days <= 0, group != 'Visit 1') |> 
+  ggplot(aes(x = days, y = Donor_ID)) +
+  geom_point(aes(shape = group, fill = event), size = 2) + 
+  scale_shape_manual(values = c(23, 21, 8), name = 'Event', 
+                     labels = c('Sample collection', 'Vaccination', 'Infection'))+
+  facet_wrap(~downsyndrome, scales = 'free_y',
+             labeller = as_labeller(c('no' = 'HC', 'yes' = 'DS'))) +
+  labs(x = 'Days from sample collection', y = 'Donor') +
+ scale_fill_manual(values = c('interval_visit2_2nd_infec_days' ="black", 
+                              'interval_visit2_from_1st_vacc_days' = "#30123BFF",
+                              'interval_visit2_from_2nd_vacc_days' = "#28BBECFF",
+                              'interval_visit2_from_3rd_vacc_days' = "#A2FC3CFF",
+                              'interval_visit2_from_4th_vacc_days' = "#FB8022FF",
+                              'interval_visit2_visit2_days' = 'grey75'),
+                    name = 'SARS-CoV-2 Vaccination', 
+                   breaks = c('interval_visit2_from_1st_vacc_days',
+                              'interval_visit2_from_2nd_vacc_days',
+                              'interval_visit2_from_3rd_vacc_days',
+                              'interval_visit2_from_4th_vacc_days'),
+                   labels = c('1st dose', '2nd dose', '3rd dose', 
+                              '4th dose')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw() +
+  theme(strip.background = element_blank(), 
+        strip.text.x = element_text(size = 15),
+        panel.grid.minor.x = element_blank(),
+        axis.title = element_text(size = 15),
+        axis.text.x = element_text(size = 13),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 15))
+
+#ggsave('results/patients_timepoints_vaccination_clean.pdf', 
+#       vacc.dates.plot.clean, width = 8.5, height = 7)
+
+subset <- read_tsv('results/antibodies/selected_patients_visit2_56.tsv')
+
+x <- vacc_dates %>% 
+  dplyr::select(Donor_ID, downsyndrome, starts_with('interval')) %>% 
+  arrange(downsyndrome, 
+          desc(interval_visit2_1st_infec_days),
+          desc(interval_visit2_from_1st_vacc_days),
+          desc(interval_visit2_from_2nd_vacc_days),
+          desc(interval_visit2_from_3rd_vacc_days)) %>% 
+  mutate(Donor_ID = factor(Donor_ID, levels = unique(Donor_ID))) %>% 
+  pivot_longer(-c(Donor_ID, downsyndrome), names_to = 'event', values_to = 'days', 
+               values_drop_na = T) %>% 
+  mutate(group = case_when(grepl('vacc', event) ~ 'Vaccination',
+                           event == 'interval_visit2_visit1_days' ~ 'Visit 1',
+                           event == 'interval_visit2_visit2_days' ~ 'Visit 2',
+                           grepl('infec', event) ~ 'Infecction')) %>% 
+  mutate(group = factor(group, levels = c('Visit 1', 'Visit 2', 'Vaccination', 
+                                          'Infecction'))) |> 
+  filter(days <= 0, group != 'Visit 1', downsyndrome == 'no',
+         Donor_ID %in% sub('_V2', '', subset$sampleid)) |>  
+  ggplot(aes(x = days, y = Donor_ID)) +
+  geom_point(aes(shape = group, fill = event), size = 2) + 
+  scale_shape_manual(values = c(23, 21, 8), name = 'Event', 
+                     labels = c('Sample collection', 'Vaccination', 'Infection'))+
+  labs(x = 'Days from sample collection', y = 'Donor') +
+ scale_fill_manual(values = c('interval_visit2_2nd_infec_days' ="black", 
+                              'interval_visit2_from_1st_vacc_days' = "#30123BFF",
+                              'interval_visit2_from_2nd_vacc_days' = "#28BBECFF",
+                              'interval_visit2_from_3rd_vacc_days' = "#A2FC3CFF",
+                              'interval_visit2_visit2_days' = 'grey75'),
+                    name = 'SARS-CoV-2 Vaccination', 
+                   breaks = c('interval_visit2_from_1st_vacc_days',
+                              'interval_visit2_from_2nd_vacc_days',
+                              'interval_visit2_from_3rd_vacc_days'),
+                   labels = c('1st dose', '2nd dose', '3rd dose')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw() +
+  theme(strip.background = element_blank(), 
+        strip.text.x = element_text(size = 15),
+        panel.grid.minor.x = element_blank(),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 13),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 15)) +
+  ggtitle('non-Down syndrome')+
+  lims(x = c(-420, 0))
+
+y <- vacc_dates %>% 
+  dplyr::select(Donor_ID, downsyndrome, starts_with('interval')) %>% 
+  arrange(downsyndrome, 
+          desc(interval_visit2_1st_infec_days),
+          desc(interval_visit2_from_1st_vacc_days),
+          desc(interval_visit2_from_2nd_vacc_days),
+          desc(interval_visit2_from_3rd_vacc_days)) %>% 
+  mutate(Donor_ID = factor(Donor_ID, levels = unique(Donor_ID))) %>% 
+  pivot_longer(-c(Donor_ID, downsyndrome), names_to = 'event', values_to = 'days', 
+               values_drop_na = T) %>% 
+  mutate(group = case_when(grepl('vacc', event) ~ 'Vaccination',
+                           event == 'interval_visit2_visit1_days' ~ 'Visit 1',
+                           event == 'interval_visit2_visit2_days' ~ 'Visit 2',
+                           grepl('infec', event) ~ 'Infecction')) %>% 
+  mutate(group = factor(group, levels = c('Visit 1', 'Visit 2', 'Vaccination', 
+                                          'Infecction'))) |> 
+  filter(days <= 0, group != 'Visit 1', downsyndrome == 'yes',
+         Donor_ID %in% sub('_V2', '', subset$sampleid)) |>  
+  ggplot(aes(x = days, y = Donor_ID)) +
+  geom_point(aes(shape = group, fill = event), size = 2) + 
+  scale_shape_manual(values = c(23, 21, 8), name = 'Event', 
+                     labels = c('Sample collection', 'Vaccination', 'Infection'))+
+  labs(x = 'Days from sample collection', y = 'Donor') +
+ scale_fill_manual(values = c('interval_visit2_2nd_infec_days' ="black", 
+                              'interval_visit2_from_1st_vacc_days' = "#30123BFF",
+                              'interval_visit2_from_2nd_vacc_days' = "#28BBECFF",
+                              'interval_visit2_from_3rd_vacc_days' = "#A2FC3CFF",
+                              'interval_visit2_visit2_days' = 'grey75'),
+                    name = 'SARS-CoV-2 Vaccination', 
+                   breaks = c('interval_visit2_from_1st_vacc_days',
+                              'interval_visit2_from_2nd_vacc_days',
+                              'interval_visit2_from_3rd_vacc_days'),
+                   labels = c('1st dose', '2nd dose', '3rd dose')) +
+  guides(fill = guide_legend(override.aes=list(shape = 21))) +
+  theme_bw() +
+  theme(strip.background = element_blank(), 
+        strip.text.x = element_text(size = 15),
+        panel.grid.minor.x = element_blank(),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 13),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 15)) +
+  ggtitle('Down syndrome') +
+  lims(x = c(-420, 0))
+
+#ggsave('results/patients_timepoints_vaccination_clean.pdf', 
+#       vacc.dates.plot.clean, width = 8.5, height = 7)
+
+
+layout <- "
+##BB
+##BB
+AABB
+AABB
+AABB
+AABB
+AABB
+AABB
+"
+
+vacc.dates.plot.subset <- x + y + plot_layout(design = layout, guides = "collect")
+
+ggsave('results/patients_timepoints_vaccination_patients_subset_56.pdf', 
+       vacc.dates.plot.subset, width = 9, height = 5)
 ```
 
 ```{r Clinical data}
@@ -237,8 +399,10 @@ sampleid = c('PlasmaControl_S91', 'PlasmaControl_S72', 'PlasmaControl_S18',
 
 group = c(rep('PlasmaControl', 7), 'WaterControl', 'WaterControl')
 
-pathseq.control.samples <- data.frame(sampleid = sampleid, group = group) 
+pathseq.control.samples <- data.frame(sampleid = sampleid, group = group)
+```
 
+```{r Clinical data}
 clinical.df <- clinical.df |> 
   rownames_to_column('sampleid') |> 
   full_join(pathseq.control.samples) |> 

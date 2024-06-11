@@ -6,7 +6,6 @@ editor_options:
 output: github_document
 ---
 
-
 ```{r Load libraries}
 library(tidyverse)
 library(rstatix)
@@ -163,6 +162,20 @@ pca.ds <-autoplot(prcomp(log1p(abs.pheno[,3:10])),
   scale_fill_manual(values= c('darkblue', 'yellow'))
 
 #ggsave('results/antibodies/pca_downsyndrome.pdf', pca.ds, width = 5.5, height = 5)
+
+# 56 patients
+subset.patients <- read_tsv('results/antibodies/selected_patients_visit2_56.tsv')
+
+subset.abs.pheno <- abs.pheno |> 
+  filter(sampleid %in% subset.patients$sampleid)
+
+pca.ds.subset <- autoplot(prcomp(log1p(subset.abs.pheno[,3:10])), 
+                  data = subset.abs.pheno, shape = 21, fill = 'ds', size = 3) +
+  scale_fill_manual(values= c('darkblue', 'yellow'))
+
+ggsave('results/antibodies/pca_downsyndrome_56patients.pdf', 
+       pca.ds.subset, width = 4.8, height = 4)
+
 ```
 
 ```{r Linear regression - DS}
@@ -238,7 +251,8 @@ abs.pheno.v2 <- abs.pheno |>
   filter(visit == 'V2', infection == 'no', number_events == 3) |> 
   column_to_rownames('sampleid') 
 
-# PVCA
+## PVCA
+# 1st method
 metadata <- abs.pheno.v2 |> 
   mutate(age_category = cut(age_years, breaks = 4),
          antigen_exposure_category = cut(abs(antigen_exposure), breaks = 4)) |>  
@@ -248,6 +262,25 @@ pvca <- PVCA(t(log1p(abs.pheno.v2[,2:9])),
              meta = metadata, threshold = 10, inter = F)
 
 PlotPVCA(pvca, title = 'PVCA - Antibodies')
+
+#2nd method
+eset <- ExpressionSet(assayData = t(log1p(abs.pheno.v2[,2:9])),
+                      phenoData = AnnotatedDataFrame(metadata))
+
+batch.factors <- c('ds', 'sex', 'age_category', 'antigen_exposure_category')
+
+pvca <- pvcaBatchAssess(eset, batch.factors = batch.factors, threshold = 0.1)
+
+df <- data.frame("Prop_var" = pvca$dat[1,], "condition" = pvca$label) %>%
+          arrange(desc(Prop_var))
+
+pvca.metabolites <- ggplot(df, aes(x = reorder(condition,Prop_var), 
+                                   y = Prop_var)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Condition",
+         y = "Proportion of variance explained") +
+    theme_bw() +
+    coord_flip()
 
 # Linear regression
 ds <- abs.pheno.v2$ds
