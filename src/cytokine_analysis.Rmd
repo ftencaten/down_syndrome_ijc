@@ -123,6 +123,236 @@ Heatmap(signif.cytokines.df, name = 'z-score', show_column_names = F,
         top_annotation = ha, column_split = ds.vector)  
 ```
 
+```{r Linear Model - age}
+library(splines)
+library(NbClust)
+library(ComplexHeatmap)
+library(fgsea)
+library(clusterProfiler)
+
+# prepare eset
+cytokines.raw <- ds.mae[['MSD.plasma']] |> 
+  as.data.frame() |> 
+  select(ends_with('_V2')) 
+  
+cytok.keep <- names(which(rowMeans(cytokines.raw == 0) <= 1/3))
+
+cytokines.raw <- cytokines.raw[cytok.keep,]
+
+pheno <- colData(ds.mae) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('patientid') |> 
+  filter(!grepl('Control', patientid)) |> 
+  mutate(sampleid = paste0(patientid, '_V2')) |> 
+  dplyr::select(sampleid, patientid, ds, age_years, weight_kg, 
+                height_meter, sex, most_recent_event, number_events, X1st.infection.date) |> 
+  mutate(height_meter = ifelse(height_meter > 100, height_meter/100, height_meter)) %>% 
+  mutate(bmi =  weight_kg/height_meter^2) %>% 
+  mutate(bmi = ifelse(bmi == 0, NA, bmi)) %>% 
+  mutate(bmi = ifelse(bmi == Inf, NA, bmi)) %>% 
+  mutate(most_recent_event = abs(most_recent_event)) |> 
+  mutate(most_recent_event = ifelse(is.na(most_recent_event), 750, most_recent_event)) |>
+  mutate(infection = ifelse(is.na(X1st.infection.date), 'no', 'yes')) |> 
+  column_to_rownames('sampleid') |> 
+  mutate(ds = ifelse(ds == 'yes', 'ds', 'nonds')) |> 
+  mutate(group = paste(ds, sex, sep = '.'))
+
+eset <- ExpressionSet(assayData = as.matrix(log1p(cytokines.raw[,rownames(pheno)])),
+                      phenoData = AnnotatedDataFrame(pheno))
+
+## Linear
+design1 <- model.matrix(~group+group:age_years+most_recent_event+0, pheno)
+colnames(design1) <- make.names(colnames(design1))
+
+fit <- lmFit(eset, design1)
+
+cont.dif <- makeContrasts(groupds.Female.age_years - groupnonds.Female.age_years,
+                          groupds.Female - groupnonds.Female,
+                          groupds.Male.age_years - groupnonds.Male.age_years,
+                          groupds.Male - groupnonds.Male,
+                          levels = design1) 
+
+fit2 <- contrasts.fit(fit, cont.dif)
+fit2 <- eBayes(fit2) 
+
+top.ds.age.female <- topTable(fit2, coef = 1:2, n = Inf, sort.by = "F")
+top.ds.age.male <- topTable(fit2, coef = 3:4, n = Inf, sort.by = "F")
+
+ds.age.female.signif <- top.ds.age.female |> 
+  filter(adj.P.Val < 0.05)
+
+ds.age.male.signif <- top.ds.age.male |> 
+  filter(adj.P.Val < 0.05)
+
+## Spline
+X <- ns(pheno$age_years, df = 5)
+
+design2 <- model.matrix(~group+group:X+most_recent_event+0, pheno)
+colnames(design2) <- make.names(colnames(design2))
+
+fit <- lmFit(eset, design2)
+
+cont.dif <- makeContrasts(groupds.Female.X1 - groupnonds.Female.X1,
+                          groupds.Female.X2 - groupnonds.Female.X2,
+                          groupds.Female.X3 - groupnonds.Female.X3,
+                          groupds.Female.X4 - groupnonds.Female.X4,
+                          groupds.Female.X5 - groupnonds.Female.X5,
+                          groupds.Female - groupnonds.Female,
+                          groupds.Male.X1 - groupnonds.Male.X1,
+                          groupds.Male.X2 - groupnonds.Male.X2,
+                          groupds.Male.X3 - groupnonds.Male.X3,
+                          groupds.Male.X4 - groupnonds.Male.X4,
+                          groupds.Male.X5 - groupnonds.Male.X5,
+                          groupds.Male - groupnonds.Male,
+                          levels = design2) 
+
+fit2 <- contrasts.fit(fit, cont.dif)
+fit2 <- eBayes(fit2) 
+
+top.ds.age.female.spline <- topTable(fit2, coef = 1:6, n = Inf, sort.by = "F")
+top.ds.age.male.spline <- topTable(fit2, coef = 7:12, n = Inf, sort.by = "F")
+
+ds.age.female.spline.signif <- top.ds.age.female.spline |> 
+  filter(adj.P.Val < 0.05)
+
+ds.age.male.spline.signif <- top.ds.age.male.spline |> 
+  filter(adj.P.Val < 0.05)
+
+## Female 
+#signif.cytokine.female <- unique(c(rownames(ds.age.female.signif),
+#                                rownames(ds.age.female.spline.signif)))
+
+signif.cytokine.female <- rownames(ds.age.female.signif)
+
+female.degs.expr <- exprs(eset[,eset$sex == 'Female']) |> 
+  as.data.frame() |> 
+  rownames_to_column('cytokine') |>  
+  filter(cytokine %in% signif.cytokine.female) |> 
+  column_to_rownames('cytokine') 
+
+pheno.sorted.f <- pheno |> 
+  filter(sex == 'Female') |> 
+  arrange(age_years)
+
+f.mat <- t(scale(t(female.degs.expr[,rownames(pheno.sorted.f)])))
+
+# Best number clusters - Gap statistic
+index = c("kl", "ch", "hartigan", "cindex", "db", "silhouette", "duda", "pseudot2", 
+          "beale", "ratkowsky", "ball", "ptbiserial", "gap", "frey", "mcclain", 
+          "gamma", "gplus", "tau", "dunn", "sdindex", "sdbw")
+
+opt.n.cluster <- list()
+for(i in seq_along(index)){
+opt.n.cluster[[i]] <- NbClust(f.mat, min.nc = 2, max.nc = 10, index = index[i],
+                         alphaBeale = 0.1, method = 'kmeans')$Best.nc[1]
+}
+names(opt.n.cluster) <- index
+
+opt.clusters <- as.double(names(which.max(table(unlist(opt.n.cluster)))))
+
+set.seed(42)
+clLS.kmeans.female <- kmeans(f.mat, opt.clusters)
+
+# plot heatmap with clusters 
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = pheno.sorted.f$age_years)
+
+draw(Heatmap(f.mat, name = 'z-score', cluster_columns = F, 
+        show_row_names = T, show_column_names = F,
+        top_annotation = column_ha, row_names_gp = gpar(fontsize = 6),
+        column_split = pheno.sorted.f$ds, row_split = clLS.kmeans.female$cluster,
+        width = unit(10, 'cm'), height = unit(6, 'cm')),
+     column_title = 'Cytokines - Female')
+
+## Male
+#signif.metab.male <- unique(c(rownames(ds.age.male.signif),
+#                                rownames(ds.age.male.spline.signif)))
+
+signif.cytokine.male <- unique(rownames(ds.age.male.signif))
+
+male.degs.expr <- exprs(eset[,eset$sex == 'Male']) |> 
+  as.data.frame() |> 
+  rownames_to_column('cytokine') |>  
+  filter(cytokine %in% signif.cytokine.male) |> 
+  column_to_rownames('cytokine') 
+
+pheno.sorted.m <- pheno |> 
+  filter(sex == 'Male') |> 
+  arrange(age_years)
+
+m.mat <- t(scale(t(male.degs.expr[,rownames(pheno.sorted.m)])))
+
+# Best number clusters - Gap statistic
+index = c("kl", "ch", "hartigan", "cindex", "db", "silhouette", "duda", "pseudot2", 
+          "beale", "ratkowsky", "ball", "ptbiserial", "gap", "frey", "mcclain", 
+          "gamma", "gplus", "tau", "dunn", "sdindex", "sdbw")
+
+opt.n.cluster <- list()
+for(i in seq_along(index)){
+opt.n.cluster[[i]] <- NbClust(m.mat, min.nc = 2, max.nc = 10, index = index[i],
+                         alphaBeale = 0.1, method = 'kmeans')$Best.nc[1]
+}
+names(opt.n.cluster) <- index
+
+opt.clusters <- as.double(names(which.max(table(unlist(opt.n.cluster)))))
+
+clLS.kmeans.male <- kmeans(m.mat.imputed, 2)
+
+# Plot heatmap with clusters
+column_ha = ComplexHeatmap::HeatmapAnnotation(age_years = pheno.sorted.m$age_years)
+
+draw(Heatmap(m.mat, name = 'z-score', cluster_columns = F, 
+        show_row_names = T, show_column_names = F, 
+        top_annotation = column_ha, row_names_gp = gpar(fontsize = 7),
+        column_split = pheno.sorted.m$ds, 
+        #row_split = clLS.kmeans.male$cluster,
+        width = unit(10, 'cm'), height = unit(2, 'cm')), 
+     column_title = 'Cytokines - Male')
+
+## Plot individual metabolites by age group
+metab.counts.tidy <- metab.counts |> 
+  as.data.frame() |> 
+  rownames_to_column('metabid') |> 
+  left_join(rowData(metab.se) |> as.data.frame() |> 
+              rownames_to_column('metabid') |> select(metabid, PLOT_NAME, SUB_PATHWAY)) |> 
+  select(-metabid) |> 
+  pivot_longer(-c(PLOT_NAME,  SUB_PATHWAY), names_to = 'sampleid')  |> 
+  left_join(pheno |> rownames_to_column('sampleid') |> select(sampleid, sex, ds, age_years)) |> 
+  mutate(age_cat = case_when(age_years < 30 ~ '<30',
+                             age_years > 30 ~ '>30')) |> 
+  mutate(age_cat = factor(age_cat, levels = c('<30', '>30')))
+
+metab.counts.tidy |> 
+  filter(PLOT_NAME == "heme" )  |> 
+  ggplot(aes(x = ds, y = value, fill = age_cat)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), shape = 21) + 
+  facet_wrap(~sex)
+
+heme.plot <- metab.counts.tidy |> 
+  filter(PLOT_NAME == "heme" )  |> 
+  ggplot(aes(x = age_years, y = value)) +
+  geom_point(aes(fill = ds), shape = 21) +
+  geom_smooth(aes(colour = ds), method='lm', alpha = 0.3, linewidth = 1.5) +
+  #geom_smooth(aes(group = ds), method = "loess", alpha = 0.3, linewidth = 1.5) +
+  facet_wrap(~sex) +
+  ggtitle('Heme')
+
+ggsave('results/metabolites/figures/scatterplot_heme_sex_ds.pdf',
+       heme.plot, scale = 0.5)
+
+sphingosine.plot <- metab.counts.tidy |> 
+  filter(PLOT_NAME == "sphingosine 1-phosphate" )  |> 
+  ggplot(aes(x = age_years, y = value)) +
+  geom_point(aes(fill = ds), shape = 21) +
+  geom_smooth(aes(colour = ds), method='lm', alpha = 0.3, linewidth = 1.5) +
+  #geom_smooth(aes(group = ds), method = "loess", alpha = 0.3, linewidth = 1.5) +
+  facet_wrap(~sex) +
+  ggtitle('Sphingosine 1-phosphate')
+
+ggsave('results/metabolites/figures/scatterplot_sphingosine_sex_ds.pdf',
+       sphingosine.plot, scale = 0.5)
+```
+
 ```{r Correlation - ABs (Spike) vs Cytokines}
 ab.cytok <- ds.mae[['MSD.plasma']] |> 
   t() |> 
