@@ -1520,7 +1520,7 @@ meta <- dge.obj$samples[,c(5, 6, 9)] |>
 moanin_model = create_moanin_model(data = as.data.frame(dge.cpm), 
                                    meta = meta,
                                    degrees_of_freedom = 5,
-                                   log_transform=TRUE)
+                                   log_transform = TRUE)
 
 timecourseContrasts <- c("yes.Female-no.Female",
                          "yes.Male-no.Male",
@@ -1617,6 +1617,12 @@ p.m <- genes.cluster |>
 
 #ggsave('results/rnaseq/figures/moanin_cluster_trajectory_Male_kmeans.pdf', 
 #       p.m, scale = 0.5)
+
+### NbClust 
+opt.n.cluster <- NbClust(m.mat, min.nc = 2, max.nc = 10, 
+                         method = 'kmeans', 
+                         index = 'sdbw', alphaBeale = 0.1)
+
 
 ## Over representation analysis
 clLS.hgnc <- enframe(clLS.kmeans$cluster, 
