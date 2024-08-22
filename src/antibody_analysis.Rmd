@@ -232,7 +232,8 @@ topTable(fit, coef = 'dsyes')
 
 # Filter by days + # antigen exposure + no infection
 abs.pheno.v2 <- abs.pheno |> 
-  filter(visit == 'V2', most_recent_event >= -90, 
+  filter(visit == 'V2', 
+         most_recent_event >= -90, 
          infection == 'no', number_events == 3) |> 
   column_to_rownames('sampleid') |> 
   filter(!is.na(most_recent_event), !is.na(number_events))
@@ -448,6 +449,13 @@ abs.v2.noinfection  <- abs.tidy |>
 
 #ggsave('results/antibodies/boxplot_v2_titers_90days_noinfection_3vacc.pdf', 
 #       abs.v2.noinfection, width = 7, height = 7)
+
+spike_titers <- abs.v2.noinfection$data |> 
+  filter(antibody == 'SARS-CoV2 Spike') |> 
+  arrange(ds, titer)
+
+#write_tsv(spike_titers, 
+#          'results/antibodies/sarscov2_spike_titers_3vacc_noInfection_56smpl.tsv')
 
 sub.v2 <- abs.tidy |> 
   filter(visit == 'V2', infection == 'no', number_events == 3) |> 

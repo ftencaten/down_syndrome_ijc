@@ -91,7 +91,7 @@ new.otu <- z %>%
   as.data.frame() %>% 
   mutate(across(everything(), ~ifelse(. < 0, 0, .)))
 
-physeq.species.rna@otu_table <- otu_table(new.otu, taxa_are_rows = TRUE)
+physeq.species.dnacies.rna@otu_table <- otu_table(new.otu, taxa_are_rows = TRUE)
 
 pseq <- physeq.species.rna %>% 
   microbiome::transform(transform = "compositional") %>% 
@@ -104,7 +104,5 @@ plot_composition(pseq, sample.sort = 'ds', group_by = 'group',
                  otu.sort = 'abundance') +
   scale_fill_manual('species', values = colors[top_taxa(pseq)]) +
   theme(legend.position = "bottom")
-
-
 ```
 

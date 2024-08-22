@@ -1561,24 +1561,22 @@ ha =  rowAnnotation(foo = anno_mark(at = c(il1b.pos, il6.pos),
 
 col_fun = colorRamp2(c(-4, -2, 0, 2, 4), c("darkblue","blue", "white", "red", "darkred"))
 
-#Hclust
-set.seed(seed = 2)
-#fit <- clusGap(m.mat, hclustFun, K.max = 10, B = 100)
-#nC <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"], method = "Tibs2001SEmax")
-fit.kmeans <- clusGap(m.mat, kmeans, K.max = 10, iter.max = 20)
-nC.kmeans <- maxSE(fit.kmeans$Tab[, "gap"], 
-                   fit.kmeans$Tab[, "SE.sim"], 
-                   method = "Tibs2001SEmax")
+#NbClust
+index = c("kl", "ch", "hartigan", "cindex", "db", "silhouette", "duda", "pseudot2", 
+          "beale", "ratkowsky", "ball", "ptbiserial", "gap", "frey", "mcclain", 
+           "dunn", "sdindex", "sdbw")
 
-# plot gap
-plot(fit.kmeans, main = "Optimal clusters number")
-abline(v = nC.kmeans, col = "blue")
+opt.n.cluster <- list()
+for(i in seq_along(index)){
+opt.n.cluster[[i]] <- NbClust(m.mat, min.nc = 2, max.nc = 10, index = index[i],
+                         alphaBeale = 0.1, method = 'kmeans')$Best.nc[1]
+}
+names(opt.n.cluster) <- index
 
-# identify clusters
-#clLS <- hclustFun(m.mat, nC) %>%
-#  as.data.frame %>%
-#  rownames_to_column('ensemblid') 
+opt.clusters <- as.double(names(which.max(table(unlist(opt.n.cluster)))))
 
+
+set.seed(42)
 clLS.kmeans <- kmeans(m.mat, nC.kmeans)
 
 #pdf('results/rnaseq/figures/heatmap_degs_age_Male_moanin_kmeans.pdf', 
